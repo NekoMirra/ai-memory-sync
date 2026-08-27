@@ -1,0 +1,13 @@
+{
+  "vaultDir": "/path/to/your/obsidian/vault",
+  "mnemopiDb": "/path/to/mnemopi.db",
+  "debounceMs": 3000,
+  "gitAutoCommit": true,
+  "gitAutoPush": true,
+  "embeddingModel": "@cf/baai/bge-m3",
+  "embeddingApiUrl": "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1",
+  "embeddingApiKey": "<YOUR_API_KEY>",
+  "proactiveRecall": true,
+  "proactiveTopK": 5,
+  "domainClusterThreshold": 30
+}

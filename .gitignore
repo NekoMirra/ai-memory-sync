@@ -1,0 +1,14 @@
+# Build artifacts
+*.js
+*.js.map
+node_modules/
+
+# Sensitive config — copy config.example.json to config.json and edit
+config.json
+
+# Domain store (contains local paths)
+.domain-store.json
+
+# OS files
+.DS_Store
+Thumbs.db
