@@ -10,6 +10,11 @@
  *   6. 结构化 frontmatter: keywords/tags/domain 便于过滤
  *   7. 知识领域化分类 — AI 自主聚类发现领域（无硬编码），生成 MOC hub 索引笔记
  *   8. 多斜杠命令: /memory-sync, /memory-export, /memory-import, /memory-config, /memory-recall, /memory-domains, /memory-cluster
+ *   9. 记忆去重合并 — remember 前先 recall 查语义相似度，>0.85 合并而非新增
+ *  10. importance 动态衰减 — recall 命中升权，长期未命中降权
+ *  11. transcript 摘要提取 — 对话原文不直存，提取核心信息
+ *  12. 长记忆强制分块 — >1000 字符的记忆在导出时按语义分块
+ *  13. 记忆间链接 — recall 结果中关联记忆建 graph_edges 形成知识图谱
  *
  * 研究基础:
  *   - A-MEM (Zettelkasten): 记忆自主生成关键词/标签/链接
@@ -17,8 +22,9 @@
  *   - RSC: recursive semantic chunking，长记忆按段落分块
  *   - MOC (Map of Content): Obsidian 知识图谱聚类 hub 笔记
  *   - K-means++ clustering: 嵌入向量无监督聚类发现知识领域
+ *   - Forgetting curve: recall 频率驱动的 importance 动态衰减
  *
- * 事件钩子: turn_start (proactive recall) + tool_result (export) + turn_end (import)
+ * 事件钩子: turn_start (proactive recall) + tool_result (export) + turn_end (import + decay)
  *
  * 配置文件: extensions/ai-memory-sync/config.json
  */
@@ -31,6 +37,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Mnemopi } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/index.ts";
 import { embedQuery } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/core/embeddings.ts";
+import type { RecallResult } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/types.ts";
 
 // ─── 配置加载 ───
 // ─── 动态领域存储 ───
@@ -61,6 +68,10 @@ interface SyncConfig {
 	proactiveRecall: boolean;
 	proactiveTopK: number;
 	domainClusterThreshold: number;
+	dedupThreshold: number;
+	decayEnabled: boolean;
+	decayInterval: number;
+	chunkThreshold: number;
 }
 
 const CONFIG_PATH = path.join(import.meta.dir, "config.json");
@@ -78,6 +89,10 @@ function loadConfig(): SyncConfig {
 		proactiveRecall: true,
 		proactiveTopK: 5,
 		domainClusterThreshold: 30,
+		dedupThreshold: 0.85,
+		decayEnabled: true,
+		decayInterval: 3600,
+		chunkThreshold: 1000,
 	};
 	try {
 		if (fs.existsSync(CONFIG_PATH)) {
@@ -110,6 +125,7 @@ let lastExportedId: string | null = null;
 let initDone = false;
 let proactiveContext = "";
 let proactiveContextReady = false;
+let lastDecayTime = 0;
 
 // ─── 工具函数 ───
 
@@ -441,9 +457,203 @@ function semanticChunks(text: string, maxLen = 500): string[] {
 	return chunks.length > 0 ? chunks : [text];
 }
 
-// Mnemopi 实例（懒加载，带嵌入配置，走 remember() 触发向量生成）
-let _mnemopi: InstanceType<typeof Mnemopi> | null = null;
-function mnemopi(): InstanceType<typeof Mnemopi> {
+// ─── [新] 记忆去重合并 ───
+// remember 前先 recall 查语义相似度，>阈值则合并而非新增
+
+/** 余弦相似度 */
+function cosineSim(a: number[], b: number[]): number {
+	let dot = 0, na = 0, nb = 0;
+	for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] ** 2; nb += b[i] ** 2; }
+	const denom = Math.sqrt(na) * Math.sqrt(nb);
+	return denom === 0 ? 0 : dot / denom;
+}
+
+/**
+ * 检查新记忆是否和已有记忆高度相似。
+ * 如果相似度 > dedupThreshold，合并到已有记忆（更新 content + 提升 importance）。
+ * @returns 合并到的 memoryId，或 null 表示没有重复（应新建）
+ */
+async function dedupCheck(content: string, source: string): Promise<string | null> {
+	if (content.trim().length < 20) return null;
+	try {
+		const results = await mnemopi().recall(content.slice(0, 500), 3);
+		for (const r of results) {
+			if (r.score != null && r.score >= CFG.dedupThreshold) {
+				// 合并：用新内容更新已有记忆（保留较长版本），importance 取 max
+				const existingContent = r.content ?? "";
+				const merged = content.length > existingContent.length ? content : existingContent;
+				const existingImp = r.importance ?? 0.5;
+				const newImp = Math.min(1.0, Math.max(existingImp, 0.75) + 0.05);
+				mnemopi().update(r.id, merged, newImp);
+				console.log(`[ai-memory-sync] 记忆去重合并: ${r.id} (score=${r.score.toFixed(3)}, src=${source}→${r.source ?? "?"})`);
+				return r.id;
+			}
+		}
+	} catch {
+		// 去重检查失败不阻断写入
+	}
+	return null;
+}
+
+/** 带去重的 remember：先查重，有重复则合并，无则新建 */
+async function dedupRemember(content: string, source: string, importance: number): Promise<string> {
+	const existingId = await dedupCheck(content, source);
+	if (existingId) return existingId;
+	return mnemopi().remember(content, { source, importance });
+}
+
+// ─── [新] importance 动态衰减 ───
+// recall_count 高的记忆升权，长期 0 命中的降权
+
+/** 对所有记忆执行 importance 衰减/升权，间隔 decayInterval 秒执行一次 */
+function decayImportance(): void {
+	if (!CFG.decayEnabled) return;
+	const now = Date.now();
+	if (now - lastDecayTime < CFG.decayInterval * 1000) return;
+	lastDecayTime = now;
+
+	try {
+		// recall_count > 3 的记忆升权（每次 +0.02，上限 1.0）
+		db().run(
+			`UPDATE working_memory
+			 SET importance = MIN(1.0, importance + 0.02)
+			 WHERE superseded_by IS NULL
+			 AND COALESCE(recall_count, 0) > 3
+			 AND importance < 1.0`,
+		);
+		// recall_count = 0 且超过 24h 的记忆降权（每次 -0.01，下限 0.1）
+		db().run(
+			`UPDATE working_memory
+			 SET importance = MAX(0.1, importance - 0.01)
+			 WHERE superseded_by IS NULL
+			 AND COALESCE(recall_count, 0) = 0
+			 AND importance > 0.1
+			 AND timestamp < ?`,
+			[new Date(now - 86400000).toISOString()],
+		);
+		// recall_count 1-3 的轻微升权（+0.01，上限 0.95）
+		db().run(
+					`UPDATE working_memory
+			 SET importance = MIN(0.95, importance + 0.01)
+			 WHERE superseded_by IS NULL
+			 AND COALESCE(recall_count, 0) BETWEEN 1 AND 3
+			 AND importance < 0.95`,
+		);
+	} catch (e: unknown) {
+		const msg = e instanceof Error ? e.message : String(e);
+		console.error(`[ai-memory-sync] importance 衰减失败: ${msg}`);
+	}
+}
+
+// ─── [新] transcript 摘要提取 ───
+// 对话原文不直存，提取核心信息
+
+/** 判断是否是 transcript 原文 */
+function isTranscript(content: string): boolean {
+	return content.includes("[role: user]") || content.includes("[role: assistant]") || content.includes("[user:end]");
+}
+
+/**
+ * 从 transcript 原文中提取核心摘要。
+ * 策略: 过滤无意义消息（继续/jixu/好等），提取有信息量的 user 消息和 assistant 关键回复。
+ * 如果提取后太短（<30字符），说明是无价值对话，返回 null。
+ */
+const NOISE_MSGS = new Set([
+	"继续", "jixu", "好", "ok", "嗯", "是", "对", "行", "可以", "收到", "继续吧",
+	"继续，记得先网络检索", "继续干活", "继续，记得先网络检索",
+]);
+
+/** 判断单条消息是否有信息量 */
+function isMeaningfulMsg(msg: string): boolean {
+	const trimmed = msg.trim().toLowerCase();
+	if (trimmed.length < 5) return false;
+	if (NOISE_MSGS.has(trimmed)) return false;
+	if (trimmed === "继续" || trimmed === "jixu") return false;
+	// 纯标点/表情
+	if (!/[a-z\u4e00-\u9fff]/i.test(trimmed)) return false;
+	return true;
+}
+
+function summarizeTranscript(content: string): string | null {
+	if (!isTranscript(content)) return content;
+
+	// 提取所有有信息量的 user 消息
+	const userMsgs: string[] = [];
+	const userPattern = /\[role:\s*user\]\s*([\s\S]*?)\s*\[user:end\]/g;
+	let m: RegExpExecArray | null;
+	while ((m = userPattern.exec(content)) !== null) {
+		const msg = m[1].trim();
+		if (isMeaningfulMsg(msg)) userMsgs.push(msg.slice(0, 200));
+	}
+
+	// 提取 assistant 消息的第一个实质段落（跳过 tool call 块）
+	const assistantMsgs: string[] = [];
+	const asstPattern = /\[role:\s*assistant\]\s*([\s\S]*?)\s*\[assistant:end\]/g;
+	while ((m = asstPattern.exec(content)) !== null) {
+		const msg = m[1].trim();
+		if (msg.length > 50 && !msg.startsWith("<parameter") && !msg.startsWith("```")) {
+			assistantMsgs.push(msg.slice(0, 200));
+		}
+	}
+
+	// 去重 user 消息（同一消息重复多次只保留一次）
+	const uniqueUserMsgs = [...new Set(userMsgs)];
+
+	// 拼接摘要
+	const parts: string[] = [];
+	if (uniqueUserMsgs.length > 0) parts.push(`用户: ${uniqueUserMsgs.join(" / ")}`);
+	if (assistantMsgs.length > 0) parts.push(`助手: ${assistantMsgs.slice(0, 3).join(" / ")}`);
+
+	const summary = parts.join("\n").trim();
+	if (summary.length < 30) return null;
+	return summary.slice(0, 500);
+}
+
+// ─── [新] 记忆间链接 ───
+// recall 结果中互相关联的记忆建 graph_edges
+
+/**
+ * 在 recall 结果中找到互相关联的记忆，插入 graph_edges。
+ * 如果 recall 返回的记忆之间相似度高，说明它们是关联记忆，建立链接。
+ */
+async function linkRelatedMemories(results: RecallResult[]): Promise<void> {
+	if (results.length < 2) return;
+	try {
+		// 取 Top-2 记忆的向量，算相似度，>0.7 则建边
+		const top = results.slice(0, Math.min(5, results.length));
+		const vecs = new Map<string, number[]>();
+		for (const r of top) {
+			const vec = await getEmbedding(r.content.slice(0, 500));
+			if (vec) vecs.set(r.id, vec);
+		}
+		const ids = [...vecs.keys()];
+		const now = new Date().toISOString();
+		for (let i = 0; i < ids.length; i++) {
+			for (let j = i + 1; j < ids.length; j++) {
+				const sim = cosineSim(vecs.get(ids[i])!, vecs.get(ids[j])!);
+				if (sim > 0.7) {
+					// 检查边是否已存在
+					const exists = sqliteQuery<{ c: number }>(
+						"SELECT COUNT(*) as c FROM graph_edges WHERE source = ? AND target = ? AND edge_type = ?",
+						[ids[i], ids[j], "semantic"],
+					);
+					if ((exists[0]?.c ?? 0) === 0) {
+						db().run(
+							"INSERT OR IGNORE INTO graph_edges (source, target, edge_type, weight, timestamp) VALUES (?, ?, ?, ?, ?)",
+							[ids[i], ids[j], "semantic", Math.round(sim * 100) / 100, now],
+						);
+					}
+				}
+			}
+		}
+	} catch {
+		// 链接失败不影响主流程
+	}
+}
+
+// ─── Mnemopi 实例（懒加载，带嵌入配置，走 remember() 触发向量生成） ───
+let _mnemopi: Mnemopi | null = null;
+function mnemopi(): Mnemopi {
 	if (!_mnemopi) {
 		_mnemopi = new Mnemopi({
 			dbPath: CFG.mnemopiDb,
@@ -458,8 +668,8 @@ function mnemopi(): InstanceType<typeof Mnemopi> {
 }
 
 // bun:sqlite 连接（懒加载，FTS5 支持）
-let _db: InstanceType<typeof Database> | null = null;
-function db(): InstanceType<typeof Database> {
+let _db: Database | null = null;
+function db(): Database {
 	if (!_db) _db = new Database(CFG.mnemopiDb);
 	return _db;
 }
@@ -467,8 +677,7 @@ function db(): InstanceType<typeof Database> {
 function sqliteQuery<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
 	try {
 		return db().query(sql).all(...params) as T[];
-	} catch (e) {
-		console.error("[ai-memory-sync] query 失败:", e);
+	} catch {
 		return [];
 	}
 }
@@ -521,14 +730,23 @@ interface MemoryRow {
 
 function exportMemoryToMarkdown(row: MemoryRow): string {
 	const src = row.source || "unknown";
-	const domain = classifyDomain(src, row.content || "");
+	let content = row.content || "";
+
+	// transcript 摘要提取
+	if (isTranscript(content)) {
+		const summary = summarizeTranscript(content);
+		if (summary === null) return "unclassified"; // 无价值对话跳过
+		content = summary;
+	}
+
+	const domain = classifyDomain(src, content);
 	const domainDir = path.join(BRAIN_MEMORIES, domain);
 	fs.mkdirSync(domainDir, { recursive: true });
 
 	const fname = `${fmtDate(row.timestamp).replace(/[: ]/g, "-")}_${String(row.id || "").slice(0, 8)}.md`;
 	const fpath = path.join(domainDir, fname);
 
-	const keywords = extractKeywords(row.content || "");
+	const keywords = extractKeywords(content);
 	const tags = [slug(src), `imp-${Math.round((row.importance || 0.5) * 10) / 10}`, domain];
 
 	let meta: Record<string, unknown> = {};
@@ -545,9 +763,10 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 		`keywords: [${keywords.map(k => `"${k}"`).join(", ")}]`,
 		`tags: [${tags.map(t => `"${t}"`).join(", ")}]`,
 		...(meta.migrated ? [`migrated: "${String(meta.migrated)}"`] : []),
+		...(isTranscript(row.content || "") ? [`summarized: true`] : []),
 		"---",
 		"",
-		row.content || "",
+		content,
 		"",
 		domain !== "unclassified" ? `\n---\n> 领域: [[_moc/${domain}|${domain}]]` : "",
 		"",
@@ -570,7 +789,7 @@ function exportNewMemories(): number {
 		);
 		for (const row of rows) {
 			const domain = exportMemoryToMarkdown(row);
-			touchedDomains.add(domain);
+			if (domain !== "unclassified") touchedDomains.add(domain);
 			lastExportedId = row.id;
 		}
 		console.log(`[ai-memory-sync] 全量导出 ${rows.length} 条记忆`);
@@ -579,7 +798,6 @@ function exportNewMemories(): number {
 		}
 		for (const d of touchedDomains) updateMocForDomain(d);
 		updateMocIndex();
-		// 触发聚类检查
 		const stats = getStats();
 		if (shouldCluster(stats.total)) void discoverDomains().catch(e => console.error(`[ai-memory-sync] 聚类失败: ${e instanceof Error ? e.message : String(e)}`));
 		return rows.length;
@@ -601,7 +819,7 @@ function exportNewMemories(): number {
 	);
 	for (const row of rows) {
 		const domain = exportMemoryToMarkdown(row);
-		touchedDomains.add(domain);
+		if (domain !== "unclassified") touchedDomains.add(domain);
 		lastExportedId = row.id;
 		if (domain === "unclassified") domainStore.unclassifiedSinceCluster++;
 	}
@@ -613,7 +831,6 @@ function exportNewMemories(): number {
 	}
 	for (const d of touchedDomains) updateMocForDomain(d);
 	updateMocIndex();
-	// 触发聚类检查
 	const stats = getStats();
 	if (shouldCluster(stats.total)) {
 		saveDomainStore(domainStore);
@@ -622,9 +839,9 @@ function exportNewMemories(): number {
 	return rows.length;
 }
 
-// ─── 导入: inbox/ → Mnemopi（带分块） ───
+// ─── 导入: inbox/ → Mnemopi（带分块 + 去重） ───
 
-function importInbox(): number {
+async function importInbox(): Promise<number> {
 	if (!fs.existsSync(INBOX)) return 0;
 
 	const files = fs.readdirSync(INBOX).filter(f => f.endsWith(".md"));
@@ -651,13 +868,12 @@ function importInbox(): number {
 		if (!content.trim()) continue;
 
 		// 语义分块后逐块写入（长笔记分成多条记忆）
-		const chunks = semanticChunks(content);
+		const chunks = semanticChunks(content, CFG.chunkThreshold);
 		let chunkErrors = 0;
 		for (const chunk of chunks) {
 			try {
-				const mem = mnemopi();
-				const id = mem.remember(chunk, { source, importance });
-				console.log(`[ai-memory-sync] remember() OK: ${id} (source=${source})`);
+				const id = await dedupRemember(chunk, source, importance);
+				console.log(`[ai-memory-sync] dedupRemember() OK: ${id} (source=${source})`);
 				imported++;
 			} catch (e) {
 				chunkErrors++;
@@ -688,7 +904,12 @@ function importInbox(): number {
 
 async function vectorRecall(query: string, topK = 5): Promise<RecallResult[]> {
 	try {
-		return await mnemopi().recall(query, topK);
+		const results = await mnemopi().recall(query, topK);
+		// 记忆间链接：检索结果中关联的记忆建 graph_edges
+		if (results.length >= 2) {
+			void linkRelatedMemories(results).catch(() => {});
+		}
+		return results;
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		console.error(`[ai-memory-sync] 向量检索失败: ${msg}`);
@@ -719,7 +940,7 @@ function buildProactiveContext(query: string): void {
 // ─── 防抖导出 ───
 
 function scheduleExport(): void {
-	if (exportTimer) clearTimeout(exportTimer);
+	clearTimeout(exportTimer);
 	exportTimer = setTimeout(() => {
 		exportTimer = null;
 		try {
@@ -741,6 +962,50 @@ function getStats(): { total: number; lastExport: string | null } {
 	return { total, lastExport };
 }
 
+// ─── [新] 数据清洗：对现有记忆做去重/摘要/分块 ───
+
+/** 清洗现有数据：transcript 摘要 + importance 重算 */
+function cleanExistingMemories(): { summarized: number; deduped: number; decayed: number } {
+	const result = { summarized: 0, deduped: 0, decayed: 0 };
+
+	// 1. transcript 摘要：找到所有 transcript 记忆，提取摘要后更新
+	const transcripts = sqliteQuery<{ id: string; content: string }>(
+		"SELECT id, content FROM working_memory WHERE superseded_by IS NULL AND content LIKE '%[role: user]%'",
+	);
+	for (const t of transcripts) {
+		const summary = summarizeTranscript(t.content);
+		if (summary !== null && summary !== t.content) {
+			db().run("UPDATE working_memory SET content = ? WHERE id = ?", [summary, t.id]);
+			result.summarized++;
+		} else if (summary === null) {
+			// 无价值对话：标记为 superseded（软删除）
+			db().run("UPDATE working_memory SET superseded_by = 'cleanup-noise' WHERE id = ?", [t.id]);
+			result.summarized++;
+		}
+	}
+
+	// 2. importance 重算：根据 recall_count 重新分配
+	const allRows = sqliteQuery<{ id: string; recall_count: number; importance: number; timestamp: string }>(
+		"SELECT id, recall_count, importance, timestamp FROM working_memory WHERE superseded_by IS NULL",
+	);
+	for (const r of allRows) {
+		const rc = r.recall_count ?? 0;
+		let newImp = r.importance;
+		if (rc > 3) newImp = Math.min(1.0, r.importance + 0.05 * Math.min(rc - 3, 5));
+		else if (rc === 0) {
+			const ageH = (Date.now() - new Date(r.timestamp).getTime()) / 3600000;
+			if (ageH > 24) newImp = Math.max(0.1, r.importance - 0.05);
+		}
+		if (newImp !== r.importance) {
+			db().run("UPDATE working_memory SET importance = ? WHERE id = ?", [newImp, r.id]);
+			result.decayed++;
+		}
+	}
+
+	console.log(`[ai-memory-sync] 数据清洗完成: 摘要 ${result.summarized} 条, importance 调整 ${result.decayed} 条`);
+	return result;
+}
+
 // ─── 扩展入口 ───
 
 export default function (pi: ExtensionAPI): void {
@@ -748,6 +1013,11 @@ export default function (pi: ExtensionAPI): void {
 
 	// 初始化: 全量导出一次
 	try {
+		// 首次加载时清洗现有数据
+		const cleaned = cleanExistingMemories();
+		if (cleaned.summarized > 0 || cleaned.decayed > 0) {
+			console.log(`[ai-memory-sync] 初始清洗: 摘要 ${cleaned.summarized}, 衰减 ${cleaned.decayed}`);
+		}
 		const count = exportNewMemories();
 		initDone = true;
 		console.log(`[ai-memory-sync] 初始化完成，导出 ${count} 条记忆到 ${CFG.vaultDir}`);
@@ -783,18 +1053,21 @@ export default function (pi: ExtensionAPI): void {
 		} catch { /* 主动检索失败不影响主流程 */ }
 	});
 
-	// 钩子 3: 每回合结束 → 检查 inbox 导入（仅在 inbox 有 .md 文件时）
+	// 钩子 3: 每回合结束 → 检查 inbox 导入 + importance 衰减
 	pi.on("turn_end", (_event: unknown, _ctx: unknown) => {
 		try {
+			// importance 衰减
+			decayImportance();
+			// inbox 导入
 			if (fs.existsSync(INBOX)) {
 				const files = fs.readdirSync(INBOX);
 				if (files.some(f => f.endsWith(".md"))) {
-					importInbox();
+					void importInbox();
 				}
 			}
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
-			console.error(`[ai-memory-sync] inbox 导入失败: ${msg}`);
+			console.error(`[ai-memory-sync] turn_end 处理失败: ${msg}`);
 		}
 	});
 
@@ -842,7 +1115,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("memory-sync", {
 		description: "手动触发 Mnemopi ↔ Obsidian vault 双向同步（导出 + 导入 + git commit）",
 		handler: async (ctx) => {
-			const imported = importInbox();
+			const imported = await importInbox();
 			const exported = exportNewMemories();
 			const stats = getStats();
 			const msg = `同步完成: 导入 ${imported} 条, 导出 ${exported} 条, 总计 ${stats.total} 条记忆`;
@@ -866,7 +1139,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("memory-import", {
 		description: "手动导入 Obsidian inbox 中的笔记到 Mnemopi（单向: Markdown → Mnemopi）",
 		handler: async (ctx) => {
-			const imported = importInbox();
+			const imported = await importInbox();
 			const msg = `导入完成: ${imported} 条`;
 			console.log(`[ai-memory-sync] ${msg}`);
 			ctx.ui?.notice?.(msg);
@@ -915,14 +1188,17 @@ export default function (pi: ExtensionAPI): void {
 				`  主动检索: ${CFG.proactiveRecall ? "开" : "关"}`,
 				`  主动检索 TopK: ${CFG.proactiveTopK}`,
 				`  嵌入模型: ${CFG.embeddingModel}`,
+				`  去重阈值: ${CFG.dedupThreshold}`,
+				`  衰减启用: ${CFG.decayEnabled ? "开" : "关"}`,
+				`  分块阈值: ${CFG.chunkThreshold} 字符`,
 				"",
 				"统计:",
 				`  Mnemopi 总记忆: ${stats.total} 条`,
 				`  最新记忆时间: ${stats.lastExport || "无"}`,
 				`  初始化状态: ${initDone ? "完成" : "未完成"}`,
-			`  主动检索上下文: ${proactiveContext ? "已加载" : "空"}`,
-			`  领域聚类阈值: ${CFG.domainClusterThreshold} 条`,
-			`  已发现领域: ${domainStore.domains.length} 个`,
+				`  主动检索上下文: ${proactiveContext ? "已加载" : "空"}`,
+				`  领域聚类阈值: ${CFG.domainClusterThreshold} 条`,
+				`  已发现领域: ${domainStore.domains.length} 个`,
 			];
 			const msg = lines.join("\n");
 			console.log(`[ai-memory-sync]\n${msg}`);
@@ -935,7 +1211,7 @@ export default function (pi: ExtensionAPI): void {
 		description: "查看知识领域分布统计和 AI 发现的领域",
 		handler: async (ctx) => {
 			const stats = getDomainStats();
-	const total = Object.values(stats).reduce((a, b) => a + b, 0);
+			const total = Object.values(stats).reduce((a, b) => a + b, 0);
 			const lines = [
 				"知识领域分布:",
 				`  总记忆: ${total} 条`,
@@ -947,7 +1223,7 @@ export default function (pi: ExtensionAPI): void {
 				"领域列表:",
 				...Object.entries(stats)
 					.sort(([, a], [, b]) => b - a)
-					.map(([name, count]) => `  ${name}: ${count} 条 (${Math.round(count / total * 100)}%)`),
+					.map(([name, count]) => `  ${name}: ${count} 条 (${total > 0 ? Math.round(count / total * 100) : 0}%)`),
 			];
 			if (domainStore.domains.length > 0) {
 				lines.push("", "AI 发现的领域关键词:");
@@ -977,6 +1253,27 @@ export default function (pi: ExtensionAPI): void {
 				const msg = e instanceof Error ? e.message : String(e);
 				console.error(`[ai-memory-sync] 聚类失败: ${msg}`);
 				ctx.ui?.notice?.(`聚类失败: ${msg}`);
+			}
+		},
+	});
+
+	// 命令: /memory-clean — 清洗现有数据（摘要 + 衰减 + 去重）
+	pi.registerCommand("memory-clean", {
+		description: "清洗现有记忆数据（transcript 摘要提取 + importance 重算 + 噪声标记）",
+		handler: async (ctx) => {
+			ctx.ui?.notice?.("开始数据清洗...");
+			try {
+				const result = cleanExistingMemories();
+				// 重新导出清洗后的数据
+				lastExportedId = null;
+				const exported = exportNewMemories();
+				const msg = `清洗完成: 摘要 ${result.summarized} 条, importance 调整 ${result.decayed} 条, 重新导出 ${exported} 条`;
+				console.log(`[ai-memory-sync] ${msg}`);
+				ctx.ui?.notice?.(msg);
+			} catch (e: unknown) {
+				const msg = e instanceof Error ? e.message : String(e);
+				console.error(`[ai-memory-sync] 清洗失败: ${msg}`);
+				ctx.ui?.notice?.(`清洗失败: ${msg}`);
 			}
 		},
 	});
