@@ -14,7 +14,6 @@
  *  10. importance 动态衰减 — recall 命中升权，长期未命中降权
  *  11. transcript 摘要提取 — 对话原文不直存，提取核心信息
  *  12. 长记忆强制分块 — >1000 字符的记忆在导出时按语义分块
- *  13. 记忆间链接 — recall 结果中关联记忆建 graph_edges 形成知识图谱
  *
  * 研究基础:
  *   - A-MEM (Zettelkasten): 记忆自主生成关键词/标签/链接
@@ -24,7 +23,7 @@
  *   - K-means++ clustering: 嵌入向量无监督聚类发现知识领域
  *   - Forgetting curve: recall 频率驱动的 importance 动态衰减
  *
- * 事件钩子: turn_start (proactive recall) + tool_result (export) + turn_end (import + decay)
+ * 事件钩子: before_agent_start (proactive recall) + tool_result (export) + turn_end (import + decay)
  *
  * 配置文件: extensions/ai-memory-sync/config.json
  */
@@ -34,10 +33,9 @@ import * as path from "node:path";
 import { execSync } from "node:child_process";
 import { Database } from "bun:sqlite";
 import { Type } from "typebox";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Mnemopi } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/index.ts";
-import { embedQuery } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/core/embeddings.ts";
-import type { RecallResult } from "D:/NekoMirra/bun-global/node_modules/@oh-my-pi/pi-mnemopi/src/types.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Mnemopi } from "@oh-my-pi/pi-mnemopi";
+import type { RecallResult } from "@oh-my-pi/pi-mnemopi/types";
 
 // ─── 配置加载 ───
 // ─── 动态领域存储 ───
@@ -108,6 +106,14 @@ function loadConfig(): SyncConfig {
 
 const CFG = loadConfig();
 
+// 密钥占位符（$$…$$）由 omp 在进程启动时还原进环境变量，扩展读 config.json 拿到的是字面量
+const EMBED_KEY = /^\$\$/.test(CFG.embeddingApiKey)
+	? (process.env.CLOUDFLARE_API_TOKEN ?? "")
+	: CFG.embeddingApiKey;
+if (EMBED_KEY === "") {
+	console.error("[ai-memory-sync] 未取得 embedding API key：config.json 的 embeddingApiKey 是占位符且 process.env.CLOUDFLARE_API_TOKEN 为空");
+}
+
 // ─── 路径常量 ───
 
 const BRAIN_MEMORIES = path.join(CFG.vaultDir, "brain", "memories");
@@ -120,12 +126,36 @@ const SESSIONS = path.join(CFG.vaultDir, "sessions");
 
 // ─── 防抖 ───
 
-let exportTimer: ReturnType<typeof setTimeout> | null = null;
+let exportTimer: Timer | null = null;
 let lastExportedId: string | null = null;
 let initDone = false;
-let proactiveContext = "";
-let proactiveContextReady = false;
 let lastDecayTime = 0;
+
+// 导出游标：按 rowid 递增推进，落盘避免每次会话重复全量导出
+const CURSOR_PATH = path.join(import.meta.dir, ".sync-cursor.json");
+
+/** 读游标文件，不存在或损坏视为无游标 */
+function loadCursor(): string | null {
+	try {
+		if (!fs.existsSync(CURSOR_PATH)) return null;
+		const raw = JSON.parse(fs.readFileSync(CURSOR_PATH, "utf8")) as { lastExportedId?: string | null };
+		return raw.lastExportedId ?? null;
+	} catch (e: unknown) {
+		console.error(`[ai-memory-sync] 游标读取失败，按无游标处理: ${e instanceof Error ? e.message : String(e)}`);
+		return null;
+	}
+}
+
+/** 落盘当前游标；safe for concurrent calls（单文件整体覆盖写） */
+function saveCursor(): void {
+	try {
+		fs.writeFileSync(CURSOR_PATH, JSON.stringify({ lastExportedId }, null, 2), "utf8");
+	} catch (e: unknown) {
+		console.error(`[ai-memory-sync] 游标保存失败: ${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
+lastExportedId = loadCursor();
 
 // ─── 工具函数 ───
 
@@ -137,9 +167,20 @@ function slug(str: string, max = 60): string {
 		.slice(0, max) || "unknown";
 }
 
+/** 规范化时间戳为 "YYYY-MM-DD HH:MM:SS"；无值返回空串，不回落当前时间 */
 function fmtDate(ts?: string): string {
-	if (!ts) return new Date().toISOString().slice(0, 19);
+	if (!ts) return "";
 	return ts.replace("T", " ").replace(/\.\d+Z?$/, "").slice(0, 19);
+}
+
+/** 笔记文件名：时间戳 + 记忆 id 前 8 位；同一记忆的文件名恒定 */
+function memoryFileName(id: string, stamp: string): string {
+	return `${stamp.replace(/[^0-9A-Za-z]+/g, "-")}_${id.slice(0, 8)}.md`;
+}
+
+/** 记忆的导出时间戳：优先记录时间，其次入库时间，两者皆空标为 undated */
+function stampOf(row: Pick<MemoryRow, "timestamp" | "created_at">): string {
+	return fmtDate(row.timestamp || row.created_at) || "undated";
 }
 
 function ensureDirs(): void {
@@ -241,16 +282,27 @@ function shouldCluster(totalMemories: number): boolean {
 	return domainStore.unclassifiedSinceCluster >= CFG.domainClusterThreshold && growth >= CFG.domainClusterThreshold;
 }
 
-/** 调用 Mnemopi 的嵌入 API 获取向量 */
-async function getEmbedding(text: string): Promise<number[] | null> {
+/** 走宿主同一模型的批量嵌入；safe for concurrent calls（只读 CFG/EMBED_KEY + fetch） */
+async function embedBatch(texts: string[]): Promise<(number[] | null)[]> {
+	if (texts.length === 0) return [];
 	try {
-		const vec = await embedQuery(text);
-		if (!vec) return null;
-		return Array.from(vec);
+		const res = await fetch(`${CFG.embeddingApiUrl.replace(/\/+$/, "")}/embeddings`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${EMBED_KEY}` },
+			body: JSON.stringify({ model: CFG.embeddingModel, input: texts }),
+			signal: AbortSignal.timeout(30000),
+		});
+		if (!res.ok) {
+			console.error(`[ai-memory-sync] 嵌入请求失败: HTTP ${res.status}`);
+			return texts.map(() => null);
+		}
+		const payload = (await res.json()) as { data?: Array<{ embedding: number[] }> };
+		const data = payload.data;
+		if (!data) return texts.map(() => null);
+		return texts.map((_, i) => data[i]?.embedding ?? null);
 	} catch (e: unknown) {
-		const msg = e instanceof Error ? e.message : String(e);
-		console.error(`[ai-memory-sync] 嵌入向量获取失败: ${msg}`);
-		return null;
+		console.error(`[ai-memory-sync] 嵌入请求异常: ${e instanceof Error ? e.message : String(e)}`);
+		return texts.map(() => null);
 	}
 }
 
@@ -263,12 +315,26 @@ async function discoverDomains(): Promise<void> {
 
 	console.log(`[ai-memory-sync] 开始领域聚类: ${unclassified.length} 条记忆`);
 
-	// 收集所有记忆的嵌入向量
-	const vectors: Map<string, number[]> = new Map();
-	for (const row of unclassified) {
-		const text = `${row.source} ${row.content}`.slice(0, 500);
-		const vec = await getEmbedding(text);
-		if (vec) vectors.set(row.id, vec);
+	// 优先复用库内已有的 bge-m3 向量，只对缺向量的行批量补算
+	const stored = new Map<string, number[]>();
+	for (const row of sqliteQuery<{ memory_id: string; embedding_json: string }>(
+		"SELECT memory_id, embedding_json FROM memory_embeddings",
+	)) {
+		try {
+			const vec = JSON.parse(row.embedding_json) as number[];
+			if (Array.isArray(vec) && vec.length > 0) stored.set(row.memory_id, vec);
+		} catch {
+			console.error(`[ai-memory-sync] 跳过坏向量行 ${row.memory_id}`);
+		}
+	}
+	const wanted = new Set(unclassified.map(r => r.id));
+	const vectors = new Map<string, number[]>();
+	for (const [id, vec] of stored) if (wanted.has(id)) vectors.set(id, vec);
+	const missing = unclassified.filter(r => !vectors.has(r.id));
+	for (let i = 0; i < missing.length; i += 32) {
+		const slice = missing.slice(i, i + 32);
+		const vecs = await embedBatch(slice.map(r => `${r.source ?? ""} ${r.content}`.slice(0, 500)));
+		vecs.forEach((vec, j) => { if (vec) vectors.set(slice[j].id, vec); });
 	}
 	if (vectors.size < CFG.domainClusterThreshold) return;
 
@@ -279,9 +345,12 @@ async function discoverDomains(): Promise<void> {
 	const clusters = kmeans(mat, k);
 
 	// 为每个聚类提取关键词，生成领域
+	const byId = new Map(unclassified.map(r => [r.id, r]));
 	const newDomains: DiscoveredDomain[] = [];
 	for (let ci = 0; ci < clusters.length; ci++) {
-		const members = clusters[ci].map(idx => unclassified[idx]);
+		const members = clusters[ci]
+			.map(idx => byId.get(ids[idx]!))
+			.filter((r): r is typeof unclassified[number] => r !== undefined);
 		if (members.length < 3) continue; // 太小的聚类跳过
 		const allText = members.map(m => `${m.source} ${m.content}`).join(" ");
 		const keywords = extractKeywords(allText, 10);
@@ -308,13 +377,16 @@ async function discoverDomains(): Promise<void> {
 	domainStore.totalAtCluster = unclassified.length;
 	saveDomainStore(domainStore);
 
-	// 重新分类所有记忆并更新 MOC
+	// 重新分类所有记忆并更新 MOC（聚类在 gitCommit 之后异步跑完，这里改动的文件由本次提交兜住）
 	const touched = new Set<string>();
 	for (const row of unclassified) {
 		const domain = classifyDomain(row.source, row.content);
 		if (domain !== "unclassified") touched.add(domain);
 	}
-	for (const d of touched) updateMocForDomain(d);
+	let mocChanged = false;
+	for (const d of touched) mocChanged = updateMocForDomain(d) || mocChanged;
+	mocChanged = updateMocIndex() || mocChanged;
+	if (mocChanged) gitCommit("sync: 领域聚类刷新 MOC");
 	console.log(`[ai-memory-sync] 领域聚类完成: ${newDomains.length} 个新领域, 更新 ${touched.size} 个 MOC`);
 }
 
@@ -365,14 +437,26 @@ function euclid(a: number[], b: number[]): number {
 
 // ─── MOC 索引笔记生成 ───
 
-function updateMocForDomain(domain: string): void {
-	if (domain === "unclassified" || domain === "general") return;
+/** 内容未变化时跳过写入；比较时忽略只表示刷新时间的 updated 字段，避免每次启动产生无意义提交 */
+function writeIfChanged(filePath: string, content: string): boolean {
+	if (fs.existsSync(filePath)) {
+		const stripRefreshTime = (s: string) => s.split("\n").filter(l => !/^\s*"?updated"?\s*:/.test(l)).join("\n");
+		const prev = fs.readFileSync(filePath, "utf8");
+		if (prev === content || stripRefreshTime(prev) === stripRefreshTime(content)) return false;
+	}
+	fs.writeFileSync(filePath, content, "utf8");
+	return true;
+}
+
+/** 写领域 MOC；返回文件是否真的变化 */
+function updateMocForDomain(domain: string): boolean {
+	if (domain === "unclassified" || domain === "general") return false;
 	fs.mkdirSync(MOC_DIR, { recursive: true });
 	const mocPath = path.join(MOC_DIR, `${domain}.md`);
 	const domainDir = path.join(BRAIN_MEMORIES, domain);
-	if (!fs.existsSync(domainDir)) return;
+	if (!fs.existsSync(domainDir)) return false;
 	const files = fs.readdirSync(domainDir).filter(f => f.endsWith(".md"));
-	if (files.length === 0) return;
+	if (files.length === 0) return false;
 	const keywords = domainStore.domains.find(d => d.name === domain)?.keywords ?? [];
 	const lines = [
 		"---",
@@ -391,10 +475,11 @@ function updateMocForDomain(domain: string): void {
 		...files.sort().map(f => `- [[${domain}/${f.replace(/\.md$/, "")}]]`),
 		"",
 	];
-	fs.writeFileSync(mocPath, lines.join("\n"), "utf8");
+	return writeIfChanged(mocPath, lines.join("\n"));
 }
 
-function updateMocIndex(): void {
+/** 写 MOC 索引；返回文件是否真的变化 */
+function updateMocIndex(): boolean {
 	fs.mkdirSync(MOC_DIR, { recursive: true });
 	const domainDirs = fs.existsSync(BRAIN_MEMORIES) ? fs.readdirSync(BRAIN_MEMORIES) : [];
 	const index: Record<string, { count: number; keywords: string[] }> = {};
@@ -412,7 +497,7 @@ function updateMocIndex(): void {
 		totalDomains: Object.keys(index).length,
 		domains: index,
 	};
-	fs.writeFileSync(path.join(MOC_DIR, "_index.json"), JSON.stringify(indexData, null, 2), "utf8");
+	return writeIfChanged(path.join(MOC_DIR, "_index.json"), JSON.stringify(indexData, null, 2));
 }
 
 function getDomainStats(): Record<string, number> {
@@ -460,14 +545,6 @@ function semanticChunks(text: string, maxLen = 500): string[] {
 // ─── [新] 记忆去重合并 ───
 // remember 前先 recall 查语义相似度，>阈值则合并而非新增
 
-/** 余弦相似度 */
-function cosineSim(a: number[], b: number[]): number {
-	let dot = 0, na = 0, nb = 0;
-	for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] ** 2; nb += b[i] ** 2; }
-	const denom = Math.sqrt(na) * Math.sqrt(nb);
-	return denom === 0 ? 0 : dot / denom;
-}
-
 /**
  * 检查新记忆是否和已有记忆高度相似。
  * 如果相似度 > dedupThreshold，合并到已有记忆（更新 content + 提升 importance）。
@@ -505,43 +582,36 @@ async function dedupRemember(content: string, source: string, importance: number
 // ─── [新] importance 动态衰减 ───
 // recall_count 高的记忆升权，长期 0 命中的降权
 
-/** 对所有记忆执行 importance 衰减/升权，间隔 decayInterval 秒执行一次 */
+/** 对所有记忆执行 importance 衰减/升权，间隔 decayInterval 秒执行一次。
+ * 一次查询取全量，逐行走库 API 更新（FTS 与向量随库写入同步） */
 function decayImportance(): void {
 	if (!CFG.decayEnabled) return;
 	const now = Date.now();
 	if (now - lastDecayTime < CFG.decayInterval * 1000) return;
 	lastDecayTime = now;
 
-	try {
-		// recall_count > 3 的记忆升权（每次 +0.02，上限 1.0）
-		db().run(
-			`UPDATE working_memory
-			 SET importance = MIN(1.0, importance + 0.02)
-			 WHERE superseded_by IS NULL
-			 AND COALESCE(recall_count, 0) > 3
-			 AND importance < 1.0`,
-		);
-		// recall_count = 0 且超过 24h 的记忆降权（每次 -0.01，下限 0.1）
-		db().run(
-			`UPDATE working_memory
-			 SET importance = MAX(0.1, importance - 0.01)
-			 WHERE superseded_by IS NULL
-			 AND COALESCE(recall_count, 0) = 0
-			 AND importance > 0.1
-			 AND timestamp < ?`,
-			[new Date(now - 86400000).toISOString()],
-		);
-		// recall_count 1-3 的轻微升权（+0.01，上限 0.95）
-		db().run(
-					`UPDATE working_memory
-			 SET importance = MIN(0.95, importance + 0.01)
-			 WHERE superseded_by IS NULL
-			 AND COALESCE(recall_count, 0) BETWEEN 1 AND 3
-			 AND importance < 0.95`,
-		);
-	} catch (e: unknown) {
-		const msg = e instanceof Error ? e.message : String(e);
-		console.error(`[ai-memory-sync] importance 衰减失败: ${msg}`);
+	const rows = sqliteQuery<{
+		id: string;
+		recall_count: number | null;
+		importance: number;
+		timestamp: string | null;
+		created_at: string | null;
+	}>("SELECT id, recall_count, importance, timestamp, created_at FROM working_memory WHERE superseded_by IS NULL");
+
+	const cutoff = now - 86400000;
+	for (const r of rows) {
+		const rc = r.recall_count ?? 0;
+		let next: number | null = null;
+		// recall_count > 3 升权（+0.02，上限 1.0）
+		if (rc > 3 && r.importance < 1.0) next = Math.min(1.0, r.importance + 0.02);
+		// recall_count = 0 且超过 24h 降权（-0.01，下限 0.1）
+		else if (rc === 0 && r.importance > 0.1 && new Date(r.timestamp || r.created_at || 0).getTime() < cutoff)
+			next = Math.max(0.1, r.importance - 0.01);
+		// recall_count 1-3 轻微升权（+0.01，上限 0.95）
+		else if (rc >= 1 && rc <= 3 && r.importance < 0.95)
+			next = Math.min(0.95, r.importance + 0.01);
+		if (next === null) continue;
+		mnemopi().update(r.id, null, next);
 	}
 }
 
@@ -609,59 +679,22 @@ function summarizeTranscript(content: string): string | null {
 	return summary.slice(0, 500);
 }
 
-// ─── [新] 记忆间链接 ───
-// recall 结果中互相关联的记忆建 graph_edges
-
-/**
- * 在 recall 结果中找到互相关联的记忆，插入 graph_edges。
- * 如果 recall 返回的记忆之间相似度高，说明它们是关联记忆，建立链接。
- */
-async function linkRelatedMemories(results: RecallResult[]): Promise<void> {
-	if (results.length < 2) return;
-	try {
-		// 取 Top-2 记忆的向量，算相似度，>0.7 则建边
-		const top = results.slice(0, Math.min(5, results.length));
-		const vecs = new Map<string, number[]>();
-		for (const r of top) {
-			const vec = await getEmbedding(r.content.slice(0, 500));
-			if (vec) vecs.set(r.id, vec);
-		}
-		const ids = [...vecs.keys()];
-		const now = new Date().toISOString();
-		for (let i = 0; i < ids.length; i++) {
-			for (let j = i + 1; j < ids.length; j++) {
-				const sim = cosineSim(vecs.get(ids[i])!, vecs.get(ids[j])!);
-				if (sim > 0.7) {
-					// 检查边是否已存在
-					const exists = sqliteQuery<{ c: number }>(
-						"SELECT COUNT(*) as c FROM graph_edges WHERE source = ? AND target = ? AND edge_type = ?",
-						[ids[i], ids[j], "semantic"],
-					);
-					if ((exists[0]?.c ?? 0) === 0) {
-						db().run(
-							"INSERT OR IGNORE INTO graph_edges (source, target, edge_type, weight, timestamp) VALUES (?, ?, ?, ?, ?)",
-							[ids[i], ids[j], "semantic", Math.round(sim * 100) / 100, now],
-						);
-					}
-				}
-			}
-		}
-	} catch {
-		// 链接失败不影响主流程
-	}
-}
-
 // ─── Mnemopi 实例（懒加载，带嵌入配置，走 remember() 触发向量生成） ───
+
+// 与宿主一致：sessionId 必须取 bank 名，否则 recall 的 `session_id = ? OR scope = 'global'` 过滤会把全部记忆挡掉
+const MEMORY_BANK = "default";
+
 let _mnemopi: Mnemopi | null = null;
+/** 懒加载的 Mnemopi 实例；safe for concurrent calls */
 function mnemopi(): Mnemopi {
 	if (!_mnemopi) {
 		_mnemopi = new Mnemopi({
 			dbPath: CFG.mnemopiDb,
-			sessionId: "ai-memory-sync",
-			bank: "default",
+			sessionId: MEMORY_BANK,
+			bank: MEMORY_BANK,
 			embeddingModel: CFG.embeddingModel,
 			embeddingApiUrl: CFG.embeddingApiUrl,
-			embeddingApiKey: CFG.embeddingApiKey,
+			embeddingApiKey: EMBED_KEY,
 		});
 	}
 	return _mnemopi;
@@ -669,16 +702,32 @@ function mnemopi(): Mnemopi {
 
 // bun:sqlite 连接（懒加载，FTS5 支持）
 let _db: Database | null = null;
-function db(): Database {
-	if (!_db) _db = new Database(CFG.mnemopiDb);
+/** 只读句柄；safe for concurrent calls */
+function readDb(): Database {
+	if (!_db) {
+		_db = new Database(CFG.mnemopiDb, { readonly: true });
+		_db.run("PRAGMA busy_timeout = 5000");
+	}
 	return _db;
 }
 
 function sqliteQuery<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
 	try {
-		return db().query(sql).all(...params) as T[];
-	} catch {
+		return readDb().query(sql).all(...params) as T[];
+	} catch (e: unknown) {
+		console.error(`[ai-memory-sync] SQL 失败: ${e instanceof Error ? e.message : String(e)} | ${sql}`);
 		return [];
+	}
+}
+
+/** 短命写连接：仅 /memory-clean 标记无价值记忆时使用，用完立即关闭 */
+function withWriteDb<T>(fn: (db: Database) => T): T {
+	const handle = new Database(CFG.mnemopiDb);
+	try {
+		handle.run("PRAGMA busy_timeout = 5000");
+		return fn(handle);
+	} finally {
+		handle.close();
 	}
 }
 
@@ -724,7 +773,8 @@ interface MemoryRow {
 	importance: number;
 	source: string;
 	scope: string;
-	timestamp: string;
+	timestamp: string | null;
+	created_at: string | null;
 	metadata_json?: string;
 }
 
@@ -743,7 +793,7 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 	const domainDir = path.join(BRAIN_MEMORIES, domain);
 	fs.mkdirSync(domainDir, { recursive: true });
 
-	const fname = `${fmtDate(row.timestamp).replace(/[: ]/g, "-")}_${String(row.id || "").slice(0, 8)}.md`;
+	const fname = memoryFileName(String(row.id || ""), stampOf(row));
 	const fpath = path.join(domainDir, fname);
 
 	const keywords = extractKeywords(content);
@@ -757,7 +807,7 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 		`id: "${row.id || ""}"`,
 		`source: "${(row.source || "").replace(/"/g, '\\"')}"`,
 		`importance: ${row.importance || 0.5}`,
-		`timestamp: "${fmtDate(row.timestamp)}"`,
+		`timestamp: "${fmtDate(row.timestamp || row.created_at)}"`,
 		`scope: "${row.scope || "global"}"`,
 		`domain: "${domain}"`,
 		`keywords: [${keywords.map(k => `"${k}"`).join(", ")}]`,
@@ -772,11 +822,40 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 		"",
 	].join("\n");
 
+	if (fs.existsSync(fpath) && fs.readFileSync(fpath, "utf8") === fm) return domain;
+
 	fs.writeFileSync(fpath, fm, "utf8");
 	return domain;
 }
 
 // ─── 导出: 增量（只导出 last_id 之后的新记忆）───
+
+/** 清理「同一记忆 id 存在多个文件名」的重复笔记；只删同一 id 的多余文件，不按缺失删除 */
+function reconcileVault(): number {
+	const rows = sqliteQuery<{ id: string; timestamp: string | null; created_at: string | null }>(
+		"SELECT id, timestamp, created_at FROM working_memory WHERE superseded_by IS NULL",
+	);
+	const canonical = new Map<string, string>();
+	for (const r of rows) canonical.set(String(r.id).slice(0, 8), memoryFileName(String(r.id), stampOf(r)));
+	if (!fs.existsSync(BRAIN_MEMORIES)) return 0;
+
+	let removed = 0;
+	for (const dir of fs.readdirSync(BRAIN_MEMORIES)) {
+		const full = path.join(BRAIN_MEMORIES, dir);
+		if (!fs.statSync(full).isDirectory()) continue;
+		for (const f of fs.readdirSync(full)) {
+			const m = f.match(/^(.*)_([0-9a-f]{8})\.md$/);
+			if (!m) continue;
+			const want = canonical.get(m[2]);
+			if (want !== undefined && want !== f) {
+				fs.unlinkSync(path.join(full, f));
+				removed++;
+			}
+		}
+	}
+	if (removed > 0) console.log(`[ai-memory-sync] 清理同 id 重复笔记 ${removed} 个`);
+	return removed;
+}
 
 function exportNewMemories(): number {
 	ensureDirs();
@@ -785,19 +864,19 @@ function exportNewMemories(): number {
 
 	if (!lastExportedId) {
 		const rows = sqliteQuery<MemoryRow>(
-			"SELECT id, content, importance, source, scope, timestamp, metadata_json FROM working_memory WHERE superseded_by IS NULL ORDER BY timestamp ASC",
+			"SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL ORDER BY rowid ASC",
 		);
 		for (const row of rows) {
 			const domain = exportMemoryToMarkdown(row);
 			if (domain !== "unclassified") touchedDomains.add(domain);
 			lastExportedId = row.id;
 		}
+		saveCursor();
 		console.log(`[ai-memory-sync] 全量导出 ${rows.length} 条记忆`);
-		if (rows.length > 0 && CFG.gitAutoCommit) {
-			gitCommit(`sync: full export ${rows.length} memories`);
-		}
+		reconcileVault();
 		for (const d of touchedDomains) updateMocForDomain(d);
 		updateMocIndex();
+		gitCommit(rows.length > 0 ? `sync: full export ${rows.length} memories` : "sync: vault reconcile");
 		const stats = getStats();
 		if (shouldCluster(stats.total)) void discoverDomains().catch(e => console.error(`[ai-memory-sync] 聚类失败: ${e instanceof Error ? e.message : String(e)}`));
 		return rows.length;
@@ -814,7 +893,7 @@ function exportNewMemories(): number {
 	}
 	const cursorRowid = cursorRows[0].rowid;
 	const rows = sqliteQuery<MemoryRow>(
-		`SELECT id, content, importance, source, scope, timestamp, metadata_json FROM working_memory WHERE superseded_by IS NULL AND rowid > ? ORDER BY rowid ASC`,
+		`SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL AND rowid > ? ORDER BY rowid ASC`,
 		[cursorRowid],
 	);
 	for (const row of rows) {
@@ -823,14 +902,12 @@ function exportNewMemories(): number {
 		lastExportedId = row.id;
 		if (domain === "unclassified") domainStore.unclassifiedSinceCluster++;
 	}
-	if (rows.length > 0) {
-		console.log(`[ai-memory-sync] 增量导出 ${rows.length} 条记忆`);
-		if (CFG.gitAutoCommit) {
-			gitCommit(`sync: ${rows.length} new memories`);
-		}
-	}
+	if (rows.length > 0) console.log(`[ai-memory-sync] 增量导出 ${rows.length} 条记忆`);
+	saveCursor();
+	reconcileVault();
 	for (const d of touchedDomains) updateMocForDomain(d);
 	updateMocIndex();
+	gitCommit(rows.length > 0 ? `sync: ${rows.length} new memories` : "sync: vault reconcile");
 	const stats = getStats();
 	if (shouldCluster(stats.total)) {
 		saveDomainStore(domainStore);
@@ -904,12 +981,7 @@ async function importInbox(): Promise<number> {
 
 async function vectorRecall(query: string, topK = 5): Promise<RecallResult[]> {
 	try {
-		const results = await mnemopi().recall(query, topK);
-		// 记忆间链接：检索结果中关联的记忆建 graph_edges
-		if (results.length >= 2) {
-			void linkRelatedMemories(results).catch(() => {});
-		}
-		return results;
+		return await mnemopi().recall(query, topK);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		console.error(`[ai-memory-sync] 向量检索失败: ${msg}`);
@@ -917,31 +989,12 @@ async function vectorRecall(query: string, topK = 5): Promise<RecallResult[]> {
 	}
 }
 
-// ─── 主动检索: 回合开始时注入相关记忆 ───
-
-function buildProactiveContext(query: string): void {
-	if (!CFG.proactiveRecall) return;
-	void vectorRecall(query, CFG.proactiveTopK).then(results => {
-		if (results.length === 0) {
-			proactiveContextReady = false;
-			return;
-		}
-		const lines = results.map((r, i) => {
-			const score = r.score ? r.score.toFixed(2) : "?";
-			const content = (r.content ?? "").slice(0, 120);
-			return `${i + 1}. [${score}] ${content}${r.truncated ? "…" : ""}`;
-		});
-		proactiveContext = `[相关记忆 ${results.length} 条]\n${lines.join("\n")}`;
-		proactiveContextReady = true;
-		console.log(`[ai-memory-sync] 主动检索注入 ${results.length} 条记忆`);
-	}).catch(() => { proactiveContextReady = false; });
-}
-
 // ─── 防抖导出 ───
 
-function scheduleExport(): void {
-	clearTimeout(exportTimer);
-	exportTimer = setTimeout(() => {
+/** 防抖导出：用会话托管定时器，回调抛错由宿主收口，不会带崩整个会话 */
+function scheduleExport(ctx: ExtensionContext): void {
+	if (exportTimer) ctx.clearTimer(exportTimer);
+	exportTimer = ctx.setTimeout(() => {
 		exportTimer = null;
 		try {
 			exportNewMemories();
@@ -975,11 +1028,11 @@ function cleanExistingMemories(): { summarized: number; deduped: number; decayed
 	for (const t of transcripts) {
 		const summary = summarizeTranscript(t.content);
 		if (summary !== null && summary !== t.content) {
-			db().run("UPDATE working_memory SET content = ? WHERE id = ?", [summary, t.id]);
+			mnemopi().update(t.id, summary, null);
 			result.summarized++;
 		} else if (summary === null) {
 			// 无价值对话：标记为 superseded（软删除）
-			db().run("UPDATE working_memory SET superseded_by = 'cleanup-noise' WHERE id = ?", [t.id]);
+			withWriteDb(handle => handle.run("UPDATE working_memory SET superseded_by = 'cleanup-noise' WHERE id = ?", [t.id]));
 			result.summarized++;
 		}
 	}
@@ -997,7 +1050,7 @@ function cleanExistingMemories(): { summarized: number; deduped: number; decayed
 			if (ageH > 24) newImp = Math.max(0.1, r.importance - 0.05);
 		}
 		if (newImp !== r.importance) {
-			db().run("UPDATE working_memory SET importance = ? WHERE id = ?", [newImp, r.id]);
+			mnemopi().update(r.id, null, newImp);
 			result.decayed++;
 		}
 	}
@@ -1011,13 +1064,8 @@ function cleanExistingMemories(): { summarized: number; deduped: number; decayed
 export default function (pi: ExtensionAPI): void {
 	ensureDirs();
 
-	// 初始化: 全量导出一次
+	// 初始化: 增量导出（游标为空时才全量）
 	try {
-		// 首次加载时清洗现有数据
-		const cleaned = cleanExistingMemories();
-		if (cleaned.summarized > 0 || cleaned.decayed > 0) {
-			console.log(`[ai-memory-sync] 初始清洗: 摘要 ${cleaned.summarized}, 衰减 ${cleaned.decayed}`);
-		}
 		const count = exportNewMemories();
 		initDone = true;
 		console.log(`[ai-memory-sync] 初始化完成，导出 ${count} 条记忆到 ${CFG.vaultDir}`);
@@ -1027,7 +1075,7 @@ export default function (pi: ExtensionAPI): void {
 	}
 
 	// 钩子 1: retain / learn 工具完成后 → 防抖导出
-	pi.on("tool_result", (event: Record<string, unknown>, _ctx: unknown) => {
+	pi.on("tool_result", (event: Record<string, unknown>, ctx: ExtensionContext) => {
 		if (event.type !== "tool_result") return;
 		const toolName = event.toolName as string;
 		if (toolName !== "retain" && toolName !== "learn") return;
@@ -1040,17 +1088,29 @@ export default function (pi: ExtensionAPI): void {
 			console.log(`[ai-memory-sync] 检测到 ${toolName} 写入，触发同步`);
 		}
 
-		scheduleExport();
+		scheduleExport(ctx);
 	});
 
-	// 钩子 2: 回合开始 → 主动检索注入相关记忆
-	pi.on("turn_start", (event: Record<string, unknown>, _ctx: unknown) => {
-		try {
-			const userMsg = event.userMessage ?? event.message ?? "";
-			if (typeof userMsg === "string" && userMsg.trim()) {
-				buildProactiveContext(userMsg.slice(0, 500));
-			}
-		} catch { /* 主动检索失败不影响主流程 */ }
+	// 钩子 2: 回合开始前 → 主动检索并把相关记忆注入本回合上下文
+	pi.on("before_agent_start", async (event, _ctx) => {
+		if (!CFG.proactiveRecall) return;
+		const prompt = typeof event.prompt === "string" ? event.prompt.trim() : "";
+		if (!prompt) return;
+		const results = await vectorRecall(prompt.slice(0, 500), CFG.proactiveTopK);
+		if (results.length === 0) return;
+		const lines = results.map((r, i) => {
+			const score = r.score ? r.score.toFixed(2) : "?";
+			const content = (r.content ?? "").slice(0, 200);
+			return `${i + 1}. [${score}] ${content}${r.truncated ? "…" : ""}`;
+		});
+		console.log(`[ai-memory-sync] 主动检索注入 ${results.length} 条记忆`);
+		return {
+			message: {
+				customType: "ai-memory-sync.recall",
+				content: `[相关记忆 ${results.length} 条]\n${lines.join("\n")}`,
+				display: false,
+			},
+		};
 	});
 
 	// 钩子 3: 每回合结束 → 检查 inbox 导入 + importance 衰减
@@ -1062,7 +1122,7 @@ export default function (pi: ExtensionAPI): void {
 			if (fs.existsSync(INBOX)) {
 				const files = fs.readdirSync(INBOX);
 				if (files.some(f => f.endsWith(".md"))) {
-					void importInbox();
+					void importInbox().catch(e => console.error(`[ai-memory-sync] inbox 导入失败: ${e instanceof Error ? e.message : String(e)}`));
 				}
 			}
 		} catch (e) {
@@ -1114,35 +1174,35 @@ export default function (pi: ExtensionAPI): void {
 	// 命令: /memory-sync — 手动双向同步
 	pi.registerCommand("memory-sync", {
 		description: "手动触发 Mnemopi ↔ Obsidian vault 双向同步（导出 + 导入 + git commit）",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const imported = await importInbox();
 			const exported = exportNewMemories();
 			const stats = getStats();
 			const msg = `同步完成: 导入 ${imported} 条, 导出 ${exported} 条, 总计 ${stats.total} 条记忆`;
 			console.log(`[ai-memory-sync] ${msg}`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
 	// 命令: /memory-export — 仅导出
 	pi.registerCommand("memory-export", {
 		description: "手动导出 Mnemopi 记忆到 Obsidian vault（单向: Mnemopi → Markdown）",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const exported = exportNewMemories();
 			const msg = `导出完成: ${exported} 条记忆`;
 			console.log(`[ai-memory-sync] ${msg}`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
 	// 命令: /memory-import — 仅导入
 	pi.registerCommand("memory-import", {
 		description: "手动导入 Obsidian inbox 中的笔记到 Mnemopi（单向: Markdown → Mnemopi）",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const imported = await importInbox();
 			const msg = `导入完成: ${imported} 条`;
 			console.log(`[ai-memory-sync] ${msg}`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
@@ -1154,12 +1214,12 @@ export default function (pi: ExtensionAPI): void {
 			const topK = /^\d+$/.test(parts[parts.length - 1] ?? "") ? parseInt(parts.pop()!, 10) : 5;
 			const query = parts.join(" ");
 			if (!query) {
-				ctx.ui?.notice?.("用法: /memory-recall <查询文本> [结果数量]");
+				ctx.ui?.notify("用法: /memory-recall <查询文本> [结果数量]", "info");
 				return;
 			}
 			const results = await vectorRecall(query, topK);
 			if (results.length === 0) {
-				ctx.ui?.notice?.("未找到匹配的记忆");
+				ctx.ui?.notify("未找到匹配的记忆", "info");
 				return;
 			}
 			const lines = results.map((r, i) => {
@@ -1169,14 +1229,14 @@ export default function (pi: ExtensionAPI): void {
 			});
 			const msg = lines.join("\n");
 			console.log(`[ai-memory-sync] 检索 "${query}" → ${results.length} 条`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
 	// 命令: /memory-config — 显示配置
 	pi.registerCommand("memory-config", {
 		description: "显示 AI Memory Sync 扩展的当前配置和统计信息",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const stats = getStats();
 			const lines = [
 				"AI Memory Sync 配置:",
@@ -1196,20 +1256,19 @@ export default function (pi: ExtensionAPI): void {
 				`  Mnemopi 总记忆: ${stats.total} 条`,
 				`  最新记忆时间: ${stats.lastExport || "无"}`,
 				`  初始化状态: ${initDone ? "完成" : "未完成"}`,
-				`  主动检索上下文: ${proactiveContext ? "已加载" : "空"}`,
 				`  领域聚类阈值: ${CFG.domainClusterThreshold} 条`,
 				`  已发现领域: ${domainStore.domains.length} 个`,
 			];
 			const msg = lines.join("\n");
 			console.log(`[ai-memory-sync]\n${msg}`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
 	// 命令: /memory-domains — 查看领域分布统计
 	pi.registerCommand("memory-domains", {
 		description: "查看知识领域分布统计和 AI 发现的领域",
-		handler: async (ctx) => {
+		handler: async (_args, ctx) => {
 			const stats = getDomainStats();
 			const total = Object.values(stats).reduce((a, b) => a + b, 0);
 			const lines = [
@@ -1233,26 +1292,26 @@ export default function (pi: ExtensionAPI): void {
 			}
 			const msg = lines.join("\n");
 			console.log(`[ai-memory-sync]\n${msg}`);
-			ctx.ui?.notice?.(msg);
+			ctx.ui?.notify(msg, "info");
 		},
 	});
 
 	// 命令: /memory-cluster — 手动触发领域聚类
 	pi.registerCommand("memory-cluster", {
 		description: "手动触发 AI 领域聚类（用嵌入向量对所有记忆做 K-means 聚类）",
-		handler: async (ctx) => {
-			ctx.ui?.notice?.("开始领域聚类，请稍候...");
+		handler: async (_args, ctx) => {
+			ctx.ui?.notify("开始领域聚类，请稍候...", "info");
 			try {
 				await discoverDomains();
 				const msg = domainStore.domains.length > 0
 					? `聚类完成: 发现 ${domainStore.domains.length} 个领域`
 					: "聚类完成: 记忆数量不足或无法生成领域";
 				console.log(`[ai-memory-sync] ${msg}`);
-				ctx.ui?.notice?.(msg);
+				ctx.ui?.notify(msg, "info");
 			} catch (e: unknown) {
 				const msg = e instanceof Error ? e.message : String(e);
 				console.error(`[ai-memory-sync] 聚类失败: ${msg}`);
-				ctx.ui?.notice?.(`聚类失败: ${msg}`);
+				ctx.ui?.notify(`聚类失败: ${msg}`, "error");
 			}
 		},
 	});
@@ -1260,8 +1319,8 @@ export default function (pi: ExtensionAPI): void {
 	// 命令: /memory-clean — 清洗现有数据（摘要 + 衰减 + 去重）
 	pi.registerCommand("memory-clean", {
 		description: "清洗现有记忆数据（transcript 摘要提取 + importance 重算 + 噪声标记）",
-		handler: async (ctx) => {
-			ctx.ui?.notice?.("开始数据清洗...");
+		handler: async (_args, ctx) => {
+			ctx.ui?.notify("开始数据清洗...", "info");
 			try {
 				const result = cleanExistingMemories();
 				// 重新导出清洗后的数据
@@ -1269,11 +1328,11 @@ export default function (pi: ExtensionAPI): void {
 				const exported = exportNewMemories();
 				const msg = `清洗完成: 摘要 ${result.summarized} 条, importance 调整 ${result.decayed} 条, 重新导出 ${exported} 条`;
 				console.log(`[ai-memory-sync] ${msg}`);
-				ctx.ui?.notice?.(msg);
+				ctx.ui?.notify(msg, "info");
 			} catch (e: unknown) {
 				const msg = e instanceof Error ? e.message : String(e);
 				console.error(`[ai-memory-sync] 清洗失败: ${msg}`);
-				ctx.ui?.notice?.(`清洗失败: ${msg}`);
+				ctx.ui?.notify(`清洗失败: ${msg}`, "error");
 			}
 		},
 	});

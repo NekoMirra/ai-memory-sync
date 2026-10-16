@@ -8,6 +8,7 @@ config.json
 
 # Domain store (contains local paths)
 .domain-store.json
+.sync-cursor.json
 
 # OS files
 .DS_Store

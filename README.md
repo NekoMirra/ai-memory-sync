@@ -35,11 +35,11 @@ git clone https://github.com/NekoMirra/ai-memory-sync.git
 # 2. 复制到 omp 扩展目录
 cp -r ai-memory-sync ~/.omp/agent/extensions/ai-memory-sync
 
-# 3. 创建配置文件
+# 3. 安装依赖与创建配置文件
 cd ~/.omp/agent/extensions/ai-memory-sync
+npm install
 cp config.example.json config.json
 # 编辑 config.json 填入你的路径和 API key
-```
 
 omp 启动时自动发现并加载扩展。
 
