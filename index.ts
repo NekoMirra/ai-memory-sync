@@ -757,6 +757,13 @@ function gitCommit(message: string): boolean {
 			const msg = stderr?.split("\n").find((l: string) => l.includes("error") || l.includes("fatal")) ?? err?.message.split("\n")[0] ?? "unknown";
 			if (attempt < 3) {
 				console.error(`[ai-memory-sync] git push 重试 ${attempt}/3: ${msg}`);
+				try {
+					execSync("git pull --rebase origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
+				} catch {
+					try {
+						execSync("git rebase --abort", { cwd: vault, encoding: "utf8", timeout: 10000 });
+					} catch {}
+				}
 			} else {
 				console.error(`[ai-memory-sync] git push 放弃（commit 已成功）: ${msg}`);
 			}
