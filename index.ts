@@ -747,6 +747,13 @@ function gitCommit(message: string): boolean {
 		return false;
 	}
 	if (!CFG.gitAutoPush) return true;
+	try {
+		execSync("git pull --rebase -X theirs origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
+	} catch {
+		try {
+			execSync("git rebase --abort", { cwd: vault, encoding: "utf8", timeout: 10000 });
+		} catch {}
+	}
 	for (let attempt = 1; attempt <= 3; attempt++) {
 		try {
 			execSync("git push", { cwd: vault, encoding: "utf8", timeout: 30000 });
@@ -758,7 +765,7 @@ function gitCommit(message: string): boolean {
 			if (attempt < 3) {
 				console.error(`[ai-memory-sync] git push 重试 ${attempt}/3: ${msg}`);
 				try {
-					execSync("git pull --rebase origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
+					execSync("git pull --rebase -X theirs origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
 				} catch {
 					try {
 						execSync("git rebase --abort", { cwd: vault, encoding: "utf8", timeout: 10000 });
