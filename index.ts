@@ -30,7 +30,8 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -95,13 +96,30 @@ function loadConfig(): SyncConfig {
 	try {
 		if (fs.existsSync(CONFIG_PATH)) {
 			const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
-			return { ...defaults, ...raw };
+			return applyEnvOverrides({ ...defaults, ...raw });
 		}
 	} catch (e: unknown) {
 		const msg = e instanceof Error ? e.message : String(e);
 		console.error(`[ai-memory-sync] 配置文件加载失败，使用默认值: ${msg}`);
 	}
-	return defaults;
+	return applyEnvOverrides(defaults);
+}
+
+/** 环境变量覆盖：把 vault 与库指到副本上做验证，避免测试写真实记忆库 */
+function applyEnvOverrides(config: SyncConfig): SyncConfig {
+	const vault = process.env.AIMS_VAULT_DIR;
+	const db = process.env.AIMS_DB_PATH;
+	if (vault) config.vaultDir = vault;
+	if (db) config.mnemopiDb = db;
+	if (process.env.AIMS_GIT === "0") {
+		config.gitAutoCommit = false;
+		config.gitAutoPush = false;
+	} else if (process.env.AIMS_GIT === "1") {
+		// 验证脚本用：即使 config.json 关着也强制开，好跑 rebase/推送路径
+		config.gitAutoCommit = true;
+		config.gitAutoPush = true;
+	}
+	return config;
 }
 
 const CFG = loadConfig();
@@ -112,6 +130,37 @@ const EMBED_KEY = /^\$\$/.test(CFG.embeddingApiKey)
 	: CFG.embeddingApiKey;
 if (EMBED_KEY === "") {
 	console.error("[ai-memory-sync] 未取得 embedding API key：config.json 的 embeddingApiKey 是占位符且 process.env.CLOUDFLARE_API_TOKEN 为空");
+}
+
+/**
+ * 单条串行链：文件写入、库读写、领域聚类互斥执行。
+ * git 已经移到独立进程（git-sync.mjs），不再占用这条链。
+ * 用 AsyncLocalStorage 标记「已持有」，嵌套调用直接执行而不是排队，否则同一把锁会自锁。
+ */
+const vaultOwner = new AsyncLocalStorage<true>();
+let vaultChain: Promise<unknown> = Promise.resolve();
+function serializeVault<T>(task: () => Promise<T>): Promise<T> {
+	if (vaultOwner.getStore() === true) return task();
+	const run = vaultChain.then(() => vaultOwner.run(true, task), () => vaultOwner.run(true, task));
+	vaultChain = run.catch(() => undefined);
+	return run;
+}
+
+/**
+ * 在锁外上下文启动后台任务。
+ * ALS 会随 await 传播，直接 `void task()` 会继承调用点的「已持锁」标记，
+ * 等它稍后回来取锁时会被误判成重入而跳过排队。
+ */
+function runDetached(task: () => Promise<void>): void {
+	void vaultOwner.exit(() => task()).catch((e: unknown) => {
+		const msg = e instanceof Error ? e.message : String(e);
+		console.error(`[ai-memory-sync] 后台任务失败: ${msg}`);
+	});
+}
+
+/** 笔记正文的稳定哈希：用于判断 vault 文件是否被人工改动过 */
+function noteHash(body: string): string {
+	return createHash("sha256").update(body, "utf8").digest("hex").slice(0, 32);
 }
 
 // ─── 路径常量 ───
@@ -377,7 +426,7 @@ async function discoverDomains(): Promise<void> {
 	domainStore.totalAtCluster = unclassified.length;
 	saveDomainStore(domainStore);
 
-	// 重新分类所有记忆并更新 MOC（聚类在 gitCommit 之后异步跑完，这里改动的文件由本次提交兜住）
+	// 重新分类所有记忆并更新 MOC（聚类在提交之后异步跑完，这里改动的文件由本次提交兜住）
 	const touched = new Set<string>();
 	for (const row of unclassified) {
 		const domain = classifyDomain(row.source, row.content);
@@ -386,7 +435,7 @@ async function discoverDomains(): Promise<void> {
 	let mocChanged = false;
 	for (const d of touched) mocChanged = updateMocForDomain(d) || mocChanged;
 	mocChanged = updateMocIndex() || mocChanged;
-	if (mocChanged) gitCommit("sync: 领域聚类刷新 MOC");
+	if (mocChanged) commitAndPush("sync: 领域聚类刷新 MOC");
 	console.log(`[ai-memory-sync] 领域聚类完成: ${newDomains.length} 个新领域, 更新 ${touched.size} 个 MOC`);
 }
 
@@ -437,6 +486,32 @@ function euclid(a: number[], b: number[]): number {
 
 // ─── MOC 索引笔记生成 ───
 
+let atomicSeq = 0;
+
+/**
+ * vault 内文件一律「临时文件 + rename」写入。
+ * git 执行器是独立进程，会在任意时刻跑 `git add -A`；直接写目标文件会让它提交半截内容。
+ * 临时文件留在 .git/aims-tmp 下，不在工作区里，不会被 git 收录。
+ * safe for concurrent calls：临时文件名带 pid 与自增序号。
+ */
+function writeVaultFile(filePath: string, content: string): void {
+	const gitDir = path.join(CFG.vaultDir, ".git");
+	if (!fs.existsSync(gitDir)) {
+		fs.writeFileSync(filePath, content, "utf8");
+		return;
+	}
+	const tmpDir = path.join(gitDir, "aims-tmp");
+	const tmp = path.join(tmpDir, `${process.pid}-${atomicSeq++}.tmp`);
+	fs.mkdirSync(tmpDir, { recursive: true });
+	fs.writeFileSync(tmp, content, "utf8");
+	try {
+		fs.renameSync(tmp, filePath);
+	} catch (e) {
+		try { fs.unlinkSync(tmp); } catch {}
+		throw e;
+	}
+}
+
 /** 内容未变化时跳过写入；比较时忽略只表示刷新时间的 updated 字段，避免每次启动产生无意义提交 */
 function writeIfChanged(filePath: string, content: string): boolean {
 	if (fs.existsSync(filePath)) {
@@ -444,7 +519,7 @@ function writeIfChanged(filePath: string, content: string): boolean {
 		const prev = fs.readFileSync(filePath, "utf8");
 		if (prev === content || stripRefreshTime(prev) === stripRefreshTime(content)) return false;
 	}
-	fs.writeFileSync(filePath, content, "utf8");
+	writeVaultFile(filePath, content);
 	return true;
 }
 
@@ -647,11 +722,14 @@ function isMeaningfulMsg(msg: string): boolean {
 function summarizeTranscript(content: string): string | null {
 	if (!isTranscript(content)) return content;
 
+	// 单条 transcript 可能达数 MB，限制扫描窗口，避免回溯正则长时间占用事件循环
+	const text = content.length > 60000 ? content.slice(0, 60000) : content;
+
 	// 提取所有有信息量的 user 消息
 	const userMsgs: string[] = [];
 	const userPattern = /\[role:\s*user\]\s*([\s\S]*?)\s*\[user:end\]/g;
 	let m: RegExpExecArray | null;
-	while ((m = userPattern.exec(content)) !== null) {
+	while ((m = userPattern.exec(text)) !== null) {
 		const msg = m[1].trim();
 		if (isMeaningfulMsg(msg)) userMsgs.push(msg.slice(0, 200));
 	}
@@ -659,7 +737,7 @@ function summarizeTranscript(content: string): string | null {
 	// 提取 assistant 消息的第一个实质段落（跳过 tool call 块）
 	const assistantMsgs: string[] = [];
 	const asstPattern = /\[role:\s*assistant\]\s*([\s\S]*?)\s*\[assistant:end\]/g;
-	while ((m = asstPattern.exec(content)) !== null) {
+	while ((m = asstPattern.exec(text)) !== null) {
 		const msg = m[1].trim();
 		if (msg.length > 50 && !msg.startsWith("<parameter") && !msg.startsWith("```")) {
 			assistantMsgs.push(msg.slice(0, 200));
@@ -731,51 +809,61 @@ function withWriteDb<T>(fn: (db: Database) => T): T {
 	}
 }
 
-// ─── Git 操作 ───
+// ─── Git 操作：投递给独立进程，主进程从不等待 ───
 
-function gitCommit(message: string): boolean {
-	if (!CFG.gitAutoCommit) return false;
-	const vault = CFG.vaultDir;
+/**
+ * 把提交请求写进队列并拉起 git-sync.mjs。
+ * 主进程不 await、不读子进程输出：Windows 上等待子进程会占住 Bun 事件循环，
+ * git 在大仓库上要数秒，正是「一同步就卡住输入」的来源。
+ * 串行与重试由 helper 内部的锁文件与退避循环负责。
+ */
+/** 已在运行的 helper 不会再拉起第二个；helper 退出后自动复位 */
+let helperRunning = false;
+
+function requestGitSync(message: string): void {
+	if (!CFG.gitAutoCommit) return;
+	const gitDir = path.join(CFG.vaultDir, ".git");
+	if (!fs.existsSync(gitDir)) return;
 	try {
-		execSync("git add -A", { cwd: vault, encoding: "utf8", timeout: 10000 });
-		const status = execSync("git status --porcelain", { cwd: vault, encoding: "utf8", timeout: 5000 });
-		if (!status.trim()) return false;
-		execSync(`git commit -m "${message.replace(/"/g, '\\"')}"`, { cwd: vault, encoding: "utf8", timeout: 10000 });
+		fs.appendFileSync(path.join(gitDir, "aims-queue.jsonl"), `${JSON.stringify({ message })}\n`, "utf8");
 	} catch (e: unknown) {
-		const msg = e instanceof Error ? e.message.split("\n")[0] : String(e);
-		console.error(`[ai-memory-sync] git commit 失败: ${msg}`);
+		console.error(`[ai-memory-sync] 写 git 队列失败: ${e instanceof Error ? e.message : String(e)}`);
+		return;
+	}
+	// 单例：helper 会自己 drain 整个队列。这里再拉一个，它只会在锁上白等 180 秒，
+	// 一个回合多次导出就会堆出一排等锁进程，把机器拖垮。
+	if (helperRunning || isHelperAlive(gitDir)) return;
+	const helper = path.join(import.meta.dir, "git-sync.mjs");
+	helperRunning = true;
+	try {
+		const proc = Bun.spawn([process.execPath, helper, CFG.vaultDir], {
+			stdio: ["ignore", "ignore", "ignore"],
+			windowsHide: true,
+			env: process.env,
+		});
+		proc.unref();
+		proc.exited.then(() => { helperRunning = false; }, () => { helperRunning = false; });
+	} catch (e: unknown) {
+		helperRunning = false;
+		console.error(`[ai-memory-sync] 启动 git 执行器失败: ${e instanceof Error ? e.message : String(e)}`);
+	}
+}
+
+/** 锁文件里的 pid 还活着就说明 helper 正在跑（上一次 omp 进程留下的也会被认出来） */
+function isHelperAlive(gitDir: string): boolean {
+	try {
+		const holder = Number.parseInt(fs.readFileSync(path.join(gitDir, "aims-sync.lock"), "utf8"), 10);
+		if (!Number.isInteger(holder) || holder <= 0) return false;
+		process.kill(holder, 0);
+		return true;
+	} catch {
 		return false;
 	}
-	if (!CFG.gitAutoPush) return true;
-	try {
-		execSync("git pull --rebase -X theirs origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
-	} catch {
-		try {
-			execSync("git rebase --abort", { cwd: vault, encoding: "utf8", timeout: 10000 });
-		} catch {}
-	}
-	for (let attempt = 1; attempt <= 3; attempt++) {
-		try {
-			execSync("git push", { cwd: vault, encoding: "utf8", timeout: 30000 });
-			return true;
-		} catch (e: unknown) {
-			const err = e instanceof Error ? e : null;
-			const stderr = (err as Error & { stderr?: string })?.stderr;
-			const msg = stderr?.split("\n").find((l: string) => l.includes("error") || l.includes("fatal")) ?? err?.message.split("\n")[0] ?? "unknown";
-			if (attempt < 3) {
-				console.error(`[ai-memory-sync] git push 重试 ${attempt}/3: ${msg}`);
-				try {
-					execSync("git pull --rebase -X theirs origin master", { cwd: vault, encoding: "utf8", timeout: 30000 });
-				} catch {
-					try {
-						execSync("git rebase --abort", { cwd: vault, encoding: "utf8", timeout: 10000 });
-					} catch {}
-				}
-			} else {
-				console.error(`[ai-memory-sync] git push 放弃（commit 已成功）: ${msg}`);
-			}
-		}
-	}
+}
+
+/** 提交并推送；本函数立即返回，实际工作在 helper 进程里跑 */
+function commitAndPush(message: string): boolean {
+	requestGitSync(message);
 	return true;
 }
 
@@ -803,19 +891,23 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 		content = summary;
 	}
 
-	const domain = classifyDomain(src, content);
+	// 分类与关键词只看开头一段：单条记忆可达数 MB，全文正则会把事件循环占住数秒
+	const sample = content.slice(0, 4000);
+	const domain = classifyDomain(src, sample);
 	const domainDir = path.join(BRAIN_MEMORIES, domain);
 	fs.mkdirSync(domainDir, { recursive: true });
 
 	const fname = memoryFileName(String(row.id || ""), stampOf(row));
 	const fpath = path.join(domainDir, fname);
 
-	const keywords = extractKeywords(content);
+	const keywords = extractKeywords(sample);
 	const tags = [slug(src), `imp-${Math.round((row.importance || 0.5) * 10) / 10}`, domain];
 
 	let meta: Record<string, unknown> = {};
 	try { meta = JSON.parse(row.metadata_json || "{}"); } catch {}
 
+	// 记录正文哈希：导入侧据此判断文件是否被人工改过，避免把导出结果当编辑回灌
+	const hash = noteHash(content.trim());
 	const fm = [
 		"---",
 		`id: "${row.id || ""}"`,
@@ -826,6 +918,7 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 		`domain: "${domain}"`,
 		`keywords: [${keywords.map(k => `"${k}"`).join(", ")}]`,
 		`tags: [${tags.map(t => `"${t}"`).join(", ")}]`,
+		`sync_hash: "${hash}"`,
 		...(meta.migrated ? [`migrated: "${String(meta.migrated)}"`] : []),
 		...(isTranscript(row.content || "") ? [`summarized: true`] : []),
 		"---",
@@ -838,13 +931,18 @@ function exportMemoryToMarkdown(row: MemoryRow): string {
 
 	if (fs.existsSync(fpath) && fs.readFileSync(fpath, "utf8") === fm) return domain;
 
-	fs.writeFileSync(fpath, fm, "utf8");
+	writeVaultFile(fpath, fm);
 	return domain;
 }
 
 // ─── 导出: 增量（只导出 last_id 之后的新记忆）───
 
-/** 清理「同一记忆 id 存在多个文件名」的重复笔记；只删同一 id 的多余文件，不按缺失删除 */
+/**
+ * 归置同一记忆 id 的多余副本。
+ * 领域分类会随聚类结果变化，同一条记忆因此可能在旧目录留下同名副本；
+ * 这里按 id 全局归并：只保留「库当前 domain 目录」下的那份，其余目录的同名文件删掉。
+ * 同目录内改名（Obsidian 常规操作）不改内容，只归位到规范名。
+ */
 function reconcileVault(): number {
 	const rows = sqliteQuery<{ id: string; timestamp: string | null; created_at: string | null }>(
 		"SELECT id, timestamp, created_at FROM working_memory WHERE superseded_by IS NULL",
@@ -853,81 +951,122 @@ function reconcileVault(): number {
 	for (const r of rows) canonical.set(String(r.id).slice(0, 8), memoryFileName(String(r.id), stampOf(r)));
 	if (!fs.existsSync(BRAIN_MEMORIES)) return 0;
 
-	let removed = 0;
+	// 每个 id 只保留一份：优先库当前分类的目录，否则取第一份
+	// 旧命名曾把完整 id 写进文件名（如 `..._eb955f82610912a0.md`），这里按前 8 位归并
+	const keeper = new Map<string, string>();
+	const duplicates: string[] = [];
 	for (const dir of fs.readdirSync(BRAIN_MEMORIES)) {
 		const full = path.join(BRAIN_MEMORIES, dir);
 		if (!fs.statSync(full).isDirectory()) continue;
 		for (const f of fs.readdirSync(full)) {
-			const m = f.match(/^(.*)_([0-9a-f]{8})\.md$/);
+			const m = f.match(/^(.*)_([0-9a-f]{8,16})\.md$/);
 			if (!m) continue;
-			const want = canonical.get(m[2]);
-			if (want !== undefined && want !== f) {
-				fs.unlinkSync(path.join(full, f));
-				removed++;
+			const key = m[2].slice(0, 8);
+			const source = path.join(full, f);
+			const current = keeper.get(key);
+			if (current === undefined) {
+				keeper.set(key, source);
+				continue;
 			}
+			// 已有保留者：规范名优先，其余进删除队列
+			const want = canonical.get(key);
+			const preferred = want !== undefined && path.basename(current) === want;
+			if (preferred) duplicates.push(source);
+			else { duplicates.push(current); keeper.set(key, source); }
 		}
 	}
-	if (removed > 0) console.log(`[ai-memory-sync] 清理同 id 重复笔记 ${removed} 个`);
-	return removed;
+
+	let cleaned = 0;
+	for (const file of duplicates) {
+		try {
+			fs.unlinkSync(file);
+			cleaned++;
+		} catch (e: unknown) {
+			console.error(`[ai-memory-sync] 清理重复副本失败 ${path.basename(file)}: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	// 剩下的按规范名归位（旧命名带完整 id、或用户改过文件名的情况）
+	let renamed = 0;
+	for (const file of keeper.values()) {
+		const m = path.basename(file).match(/^(.*)_([0-9a-f]{8,16})\.md$/);
+		if (!m) continue;
+		const want = canonical.get(m[2].slice(0, 8));
+		if (want === undefined || want === path.basename(file)) continue;
+		try {
+			fs.renameSync(file, path.join(path.dirname(file), want));
+			renamed++;
+		} catch (e: unknown) {
+			console.error(`[ai-memory-sync] 归位文件名失败 ${path.basename(file)}: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	if (cleaned > 0) console.log(`[ai-memory-sync] 清理跨目录重复笔记 ${cleaned} 个`);
+	if (renamed > 0) console.log(`[ai-memory-sync] 归置改名的笔记 ${renamed} 个（内容未动）`);
+	return cleaned + renamed;
 }
 
-function exportNewMemories(): number {
-	ensureDirs();
-	fs.mkdirSync(MOC_DIR, { recursive: true });
-	const touchedDomains = new Set<string>();
+async function exportNewMemories(): Promise<number> {
+	return serializeVault(async () => {
+		ensureDirs();
+		fs.mkdirSync(MOC_DIR, { recursive: true });
+		const touchedDomains = new Set<string>();
 
-	if (!lastExportedId) {
+		if (!lastExportedId) {
+			const rows = sqliteQuery<MemoryRow>(
+				"SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL ORDER BY rowid ASC",
+			);
+			for (const row of rows) {
+				const domain = exportMemoryToMarkdown(row);
+				if (domain !== "unclassified") touchedDomains.add(domain);
+				lastExportedId = row.id;
+			}
+			saveCursor();
+			console.log(`[ai-memory-sync] 全量导出 ${rows.length} 条记忆`);
+			reconcileVault();
+			for (const d of touchedDomains) updateMocForDomain(d);
+			updateMocIndex();
+			commitAndPush(rows.length > 0 ? `sync: full export ${rows.length} memories` : "sync: vault reconcile");
+			const stats = getStats();
+			if (shouldCluster(stats.total)) {
+				runDetached(() => discoverDomains());
+			}
+			return rows.length;
+		}
+
+		// 增量: 用 rowid 游标避免 created_at 相同时漏导
+		const cursorRows = sqliteQuery<{ rowid: number; id: string }>(
+			"SELECT rowid, id FROM working_memory WHERE id = ?",
+			[lastExportedId],
+		);
+		if (cursorRows.length === 0) {
+			lastExportedId = null;
+			return exportNewMemories();
+		}
+		const cursorRowid = cursorRows[0].rowid;
 		const rows = sqliteQuery<MemoryRow>(
-			"SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL ORDER BY rowid ASC",
+			`SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL AND rowid > ? ORDER BY rowid ASC`,
+			[cursorRowid],
 		);
 		for (const row of rows) {
 			const domain = exportMemoryToMarkdown(row);
 			if (domain !== "unclassified") touchedDomains.add(domain);
 			lastExportedId = row.id;
+			if (domain === "unclassified") domainStore.unclassifiedSinceCluster++;
 		}
+		if (rows.length > 0) console.log(`[ai-memory-sync] 增量导出 ${rows.length} 条记忆`);
 		saveCursor();
-		console.log(`[ai-memory-sync] 全量导出 ${rows.length} 条记忆`);
 		reconcileVault();
 		for (const d of touchedDomains) updateMocForDomain(d);
 		updateMocIndex();
-		gitCommit(rows.length > 0 ? `sync: full export ${rows.length} memories` : "sync: vault reconcile");
+		commitAndPush(rows.length > 0 ? `sync: ${rows.length} new memories` : "sync: vault reconcile");
 		const stats = getStats();
-		if (shouldCluster(stats.total)) void discoverDomains().catch(e => console.error(`[ai-memory-sync] 聚类失败: ${e instanceof Error ? e.message : String(e)}`));
+		if (shouldCluster(stats.total)) {
+			saveDomainStore(domainStore);
+			runDetached(() => discoverDomains());
+		}
 		return rows.length;
-	}
-
-	// 增量: 用 rowid 游标避免 created_at 相同时漏导
-	const cursorRows = sqliteQuery<{ rowid: number; id: string }>(
-		"SELECT rowid, id FROM working_memory WHERE id = ?",
-		[lastExportedId],
-	);
-	if (cursorRows.length === 0) {
-		lastExportedId = null;
-		return exportNewMemories();
-	}
-	const cursorRowid = cursorRows[0].rowid;
-	const rows = sqliteQuery<MemoryRow>(
-		`SELECT id, content, importance, source, scope, timestamp, created_at, metadata_json FROM working_memory WHERE superseded_by IS NULL AND rowid > ? ORDER BY rowid ASC`,
-		[cursorRowid],
-	);
-	for (const row of rows) {
-		const domain = exportMemoryToMarkdown(row);
-		if (domain !== "unclassified") touchedDomains.add(domain);
-		lastExportedId = row.id;
-		if (domain === "unclassified") domainStore.unclassifiedSinceCluster++;
-	}
-	if (rows.length > 0) console.log(`[ai-memory-sync] 增量导出 ${rows.length} 条记忆`);
-	saveCursor();
-	reconcileVault();
-	for (const d of touchedDomains) updateMocForDomain(d);
-	updateMocIndex();
-	gitCommit(rows.length > 0 ? `sync: ${rows.length} new memories` : "sync: vault reconcile");
-	const stats = getStats();
-	if (shouldCluster(stats.total)) {
-		saveDomainStore(domainStore);
-		void discoverDomains().catch(e => console.error(`[ai-memory-sync] 聚类失败: ${e instanceof Error ? e.message : String(e)}`));
-	}
-	return rows.length;
+	});
 }
 
 // ─── 导入: inbox/ → Mnemopi（带分块 + 去重） ───
@@ -940,21 +1079,10 @@ async function importInbox(): Promise<number> {
 
 	for (const file of files) {
 		const fpath = path.join(INBOX, file);
-		const raw = fs.readFileSync(fpath, "utf8");
-
-		let content = raw;
-		let source = `obsidian/${file}`;
-		let importance = 0.7;
-		const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)/);
-		if (fmMatch) {
-			content = fmMatch[2].trim();
-			for (const line of fmMatch[1].split("\n")) {
-				const sm = line.match(/^source:\s*"?([^"\n]*)"?\s*$/);
-				if (sm) source = sm[1];
-				const im = line.match(/^importance:\s*([\d.]+)/);
-				if (im) importance = parseFloat(im[1]);
-			}
-		}
+		const note = parseVaultNote(fs.readFileSync(fpath, "utf8"));
+		const content = note.body;
+		const source = note.source !== "" ? note.source : `obsidian/${file}`;
+		const importance = note.importance;
 
 		if (!content.trim()) continue;
 
@@ -984,15 +1112,204 @@ async function importInbox(): Promise<number> {
 
 	if (imported > 0) {
 		console.log(`[ai-memory-sync] 从 inbox 导入 ${imported} 条`);
-		if (CFG.gitAutoCommit) {
-			gitCommit(`sync: imported ${imported} from inbox`);
-		}
+		commitAndPush(`sync: imported ${imported} from inbox`);
 	}
 	return imported;
 }
 
-// ─── 向量检索 ───
+// ─── 导入: vault 内的笔记改动 → Mnemopi（双边同步的返回方向） ───
 
+interface VaultNote {
+	id: string | null;
+	source: string;
+	importance: number;
+	hash: string | null;
+	body: string;
+	/** 归一化后的整篇原文（CRLF → LF），写回时必须用它，否则会插出第二个 frontmatter */
+	text: string;
+}
+
+/** 解析笔记：frontmatter 里的 id/source/importance/sync_hash + 去页脚的正文 */
+function parseVaultNote(raw: string): VaultNote {
+	// Obsidian 与 Windows 编辑器可能写成 CRLF，先归一化，否则 frontmatter 整段匹配不上
+	const text = raw.replace(/\r\n/g, "\n");
+	const note: VaultNote = { id: null, source: "", importance: 0.7, hash: null, body: text.trim(), text };
+	const fm = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+	if (fm) {
+		for (const line of fm[1].split("\n")) {
+			const kv = line.match(/^([a-z_]+):\s*(.*)$/);
+			if (!kv) continue;
+			const value = kv[2].trim().replace(/^"(.*)"$/, "$1");
+			if (kv[1] === "id" && value !== "") note.id = value;
+			else if (kv[1] === "source") note.source = value;
+			else if (kv[1] === "sync_hash" && value !== "") note.hash = value;
+			else if (kv[1] === "importance") {
+				const num = Number.parseFloat(value);
+				if (Number.isFinite(num)) note.importance = num;
+			}
+		}
+		// 去掉导出时追加的领域链接页脚
+		note.body = fm[2].replace(/\n*---\n> 领域: \[\[_moc\/[^\]]*\]\]\s*$/, "").trim();
+	}
+	return note;
+}
+
+/** 给缺少 sync_hash 的存量笔记补标记；正文一字不动。入参必须是归一化后的文本 */
+function withSyncHash(text: string, hash: string): string {
+	const fm = text.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+	if (!fm) return `---\nsync_hash: "${hash}"\n---\n\n${text}`;
+	return `---\n${fm[1]}\nsync_hash: "${hash}"\n---\n${fm[2]}`;
+}
+
+/** 递归收集 vault 内所有 Markdown 笔记（跳过归档与 MOC） */
+function listVaultNotes(dir: string, out: string[] = []): string[] {
+	if (!fs.existsSync(dir)) return out;
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name === "imported" || entry.name === "_moc") continue;
+			listVaultNotes(full, out);
+		} else if (entry.name.endsWith(".md")) {
+			out.push(full);
+		}
+	}
+	return out;
+}
+
+/**
+ * 把 vault 里被人工改动过的笔记回灌进 Mnemopi —— 这是「本地改记忆库，omp 记不住」的修复。
+ * 判定依据是 frontmatter 的 sync_hash：与正文哈希一致说明是导出产物，跳过；
+ * 不一致说明正文被改过，按库 API 回写（FTS 与向量随之更新）。
+ * 没有 id 的笔记视为新增，导入后归档到 brain/imported/，避免下次导出产生重复笔记。
+ */
+async function importVaultEdits(): Promise<{ updated: number; added: number; stamped: number; skipped: number }> {
+	const result = { updated: 0, added: 0, stamped: 0, skipped: 0 };
+	const files: Array<{ path: string; generated: boolean }> = [
+		...listVaultNotes(BRAIN_MEMORIES).map(p => ({ path: p, generated: true })),
+		...listVaultNotes(BRAIN_DECISIONS).map(p => ({ path: p, generated: false })),
+		...listVaultNotes(BRAIN_FAILURES).map(p => ({ path: p, generated: false })),
+		...listVaultNotes(BRAIN_PROJECTS).map(p => ({ path: p, generated: false })),
+	];
+	if (files.length === 0) return result;
+
+	const known = new Map<string, { content: string; importance: number }>();
+	for (const row of sqliteQuery<{ id: string; content: string; importance: number }>(
+		"SELECT id, content, importance FROM working_memory WHERE superseded_by IS NULL",
+	)) {
+		known.set(String(row.id), { content: row.content ?? "", importance: row.importance ?? 0.5 });
+	}
+
+	for (const entry of files) {
+		const file = entry.path;
+		let raw: string;
+		try {
+			raw = fs.readFileSync(file, "utf8");
+		} catch (e: unknown) {
+			console.error(`[ai-memory-sync] 读取 ${file} 失败: ${e instanceof Error ? e.message : String(e)}`);
+			continue;
+		}
+		const note = parseVaultNote(raw);
+		if (note.body === "") continue;
+
+		const current = noteHash(note.body);
+		// 正文与我们上次写出的完全一致 → 是我们自己的产物，不是编辑
+		if (note.hash !== null && note.hash === current) continue;
+
+		if (note.id !== null) {
+			const row = known.get(note.id);
+			if (row === undefined) continue; // 已被取代或删除，不复活
+			if (row.content.trim() === note.body) {
+				// 内容一致：仅补齐 sync_hash 标记，让后续改动可被识别；不碰库
+				if (note.hash === null) {
+					writeVaultFile(file, withSyncHash(note.text, current));
+					result.stamped++;
+				}
+				continue;
+			}
+			// 没有 sync_hash 的存量笔记无法判断是「人工改动」还是「旧导出」。
+			// 库是唯一真相源，这里一律不覆盖，交给导出方向修正，避免把旧内容写回库。
+			if (note.hash === null) {
+				result.skipped++;
+				continue;
+			}
+			try {
+				// update() 只改 session_id = bank 的行；别的 bank 的行会静默返回 false
+				if (mnemopi().update(note.id, note.body, note.importance)) {
+					known.set(note.id, { content: note.body, importance: note.importance });
+					result.updated++;
+					console.log(`[ai-memory-sync] vault 编辑回灌: ${path.basename(file)} → ${note.id}`);
+				} else {
+					result.skipped++;
+					console.error(`[ai-memory-sync] 回灌被拒（该记忆不属于当前 bank）: ${note.id} ← ${path.basename(file)}`);
+				}
+			} catch (e: unknown) {
+				console.error(`[ai-memory-sync] 回灌 ${note.id} 失败: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			continue;
+		}
+
+		// 无 id：只有用户笔记区（decisions/failures/projects）才算新记忆。
+		// brain/memories 是扩展生成区，缺 id 说明文件格式异常，绝不能当新记忆批量导入。
+		if (entry.generated) {
+			console.error(`[ai-memory-sync] 跳过无 id 的生成区笔记（格式异常）: ${path.relative(CFG.vaultDir, file)}`);
+			continue;
+		}
+		try {
+			const source = note.source !== "" ? note.source : `vault/${path.relative(CFG.vaultDir, file)}`;
+			await dedupRemember(note.body, source, note.importance);
+			fs.mkdirSync(IMPORTED, { recursive: true });
+			fs.renameSync(file, path.join(IMPORTED, path.basename(file)));
+			result.added++;
+			console.log(`[ai-memory-sync] vault 新笔记导入: ${path.basename(file)}`);
+		} catch (e: unknown) {
+			console.error(`[ai-memory-sync] 导入 ${path.basename(file)} 失败: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
+	if (result.updated > 0 || result.added > 0 || result.stamped > 0) {
+		console.log(
+			`[ai-memory-sync] vault 回灌: 更新 ${result.updated} 条, 新增 ${result.added} 条, 补标记 ${result.stamped} 条` +
+			(result.skipped > 0 ? `, 跳过无来源标记的差异笔记 ${result.skipped} 条（等导出方向对齐）` : ""),
+		);
+	}
+	return result;
+}
+
+/**
+ * vault → 库 回灌，并在发现「无来源标记的差异笔记」时做一次全量导出对齐。
+ * 存量笔记升级前都没有 sync_hash，无法区分「人工改动」和「旧导出」；
+ * 库是真相源，所以对齐方向是库 → 笔记，绝不反向覆盖。
+ */
+/** 上一次回灌扫描的时间戳；before_agent_start 每回合都会调，扫描上千篇笔记要几十毫秒 */
+let lastReflowAt = 0;
+const REFLOW_MIN_INTERVAL_MS = 5000;
+/** 存量对齐只做一次：跨目录残留的旧文件永远缺 sync_hash，不能每轮都触发全量导出 */
+let legacyAligned = false;
+
+/**
+ * vault → 库 回灌，并在首次发现「无来源标记的差异笔记」时做一次全量导出对齐。
+ * 存量笔记升级前都没有 sync_hash，无法区分「人工改动」和「旧导出」；
+ * 库是真相源，所以对齐方向是库 → 笔记，绝不反向覆盖。
+ * `force=false` 时按 REFLOW_MIN_INTERVAL_MS 节流，避免每回合重复扫全盘。
+ */
+async function reflowFromVault(force = true): Promise<{ updated: number; added: number; stamped: number; skipped: number }> {
+	if (!force && Date.now() - lastReflowAt < REFLOW_MIN_INTERVAL_MS) {
+		return { updated: 0, added: 0, stamped: 0, skipped: 0 };
+	}
+	return serializeVault(async () => {
+		lastReflowAt = Date.now();
+		const result = await importVaultEdits();
+		if (result.skipped > 0 && !legacyAligned) {
+			legacyAligned = true;
+			console.log(`[ai-memory-sync] ${result.skipped} 篇笔记缺少来源标记，执行一次全量导出以对齐并补标记`);
+			lastExportedId = null;
+			await exportNewMemories();
+		}
+		return result;
+	});
+}
+
+// ─── 向量检索 ───
 async function vectorRecall(query: string, topK = 5): Promise<RecallResult[]> {
 	try {
 		return await mnemopi().recall(query, topK);
@@ -1005,17 +1322,17 @@ async function vectorRecall(query: string, topK = 5): Promise<RecallResult[]> {
 
 // ─── 防抖导出 ───
 
-/** 防抖导出：用会话托管定时器，回调抛错由宿主收口，不会带崩整个会话 */
+/**
+ * 防抖导出：用会话托管定时器，回调内 fire-and-forget 异步任务。
+ * 定时器回调本身不 await，TUI 输入不会被同步子进程或网络卡住。
+ */
 function scheduleExport(ctx: ExtensionContext): void {
 	if (exportTimer) ctx.clearTimer(exportTimer);
 	exportTimer = ctx.setTimeout(() => {
 		exportTimer = null;
-		try {
-			exportNewMemories();
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			console.error(`[ai-memory-sync] 导出失败: ${msg}`);
-		}
+		runDetached(async () => {
+			await exportNewMemories();
+		});
 	}, CFG.debounceMs);
 }
 
@@ -1078,15 +1395,16 @@ function cleanExistingMemories(): { summarized: number; deduped: number; decayed
 export default function (pi: ExtensionAPI): void {
 	ensureDirs();
 
-	// 初始化: 增量导出（游标为空时才全量）
-	try {
-		const count = exportNewMemories();
-		initDone = true;
-		console.log(`[ai-memory-sync] 初始化完成，导出 ${count} 条记忆到 ${CFG.vaultDir}`);
-	} catch (e) {
-		const msg = e instanceof Error ? e.message : String(e);
-		console.error(`[ai-memory-sync] 初始化失败: ${msg}`);
-	}
+	// 初始化: 增量导出（游标为空时才全量）。异步执行，不阻塞会话启动。
+	void exportNewMemories()
+		.then(count => {
+			initDone = true;
+			console.log(`[ai-memory-sync] 初始化完成，导出 ${count} 条记忆到 ${CFG.vaultDir}`);
+		})
+		.catch((e: unknown) => {
+			const msg = e instanceof Error ? e.message : String(e);
+			console.error(`[ai-memory-sync] 初始化失败: ${msg}`);
+		});
 
 	// 钩子 1: retain / learn 工具完成后 → 防抖导出
 	pi.on("tool_result", (event: Record<string, unknown>, ctx: ExtensionContext) => {
@@ -1105,8 +1423,15 @@ export default function (pi: ExtensionAPI): void {
 		scheduleExport(ctx);
 	});
 
-	// 钩子 2: 回合开始前 → 主动检索并把相关记忆注入本回合上下文
+	// 钩子 2: 回合开始前 → 先把 vault 的人工改动回灌进库，再主动检索注入
 	pi.on("before_agent_start", async (event, _ctx) => {
+		// 回灌放在检索之前，保证本回合读到的就是 vault 里的最新内容；
+		// 这里走节流版，避免每回合都扫一遍上千篇笔记
+		try {
+			await reflowFromVault(false);
+		} catch (e: unknown) {
+			console.error(`[ai-memory-sync] vault 回灌失败: ${e instanceof Error ? e.message : String(e)}`);
+		}
 		if (!CFG.proactiveRecall) return;
 		const prompt = typeof event.prompt === "string" ? event.prompt.trim() : "";
 		if (!prompt) return;
@@ -1127,22 +1452,20 @@ export default function (pi: ExtensionAPI): void {
 		};
 	});
 
-	// 钩子 3: 每回合结束 → 检查 inbox 导入 + importance 衰减
+	// 钩子 3: 每回合结束 → inbox 导入 + vault 回灌 + importance 衰减（全部异步，不阻塞）
 	pi.on("turn_end", (_event: unknown, _ctx: unknown) => {
-		try {
-			// importance 衰减
-			decayImportance();
-			// inbox 导入
-			if (fs.existsSync(INBOX)) {
-				const files = fs.readdirSync(INBOX);
-				if (files.some(f => f.endsWith(".md"))) {
-					void importInbox().catch(e => console.error(`[ai-memory-sync] inbox 导入失败: ${e instanceof Error ? e.message : String(e)}`));
+		void (async () => {
+			try {
+				decayImportance();
+				if (fs.existsSync(INBOX) && fs.readdirSync(INBOX).some(f => f.endsWith(".md"))) {
+					await importInbox();
 				}
+				await reflowFromVault();
+			} catch (e: unknown) {
+				const msg = e instanceof Error ? e.message : String(e);
+				console.error(`[ai-memory-sync] turn_end 处理失败: ${msg}`);
 			}
-		} catch (e) {
-			const msg = e instanceof Error ? e.message : String(e);
-			console.error(`[ai-memory-sync] turn_end 处理失败: ${msg}`);
-		}
+		})();
 	});
 
 	// 工具: memory_recall — 模型主动调用向量化语义检索
@@ -1190,9 +1513,10 @@ export default function (pi: ExtensionAPI): void {
 		description: "手动触发 Mnemopi ↔ Obsidian vault 双向同步（导出 + 导入 + git commit）",
 		handler: async (_args, ctx) => {
 			const imported = await importInbox();
-			const exported = exportNewMemories();
+			const reflowed = await reflowFromVault();
+			const exported = await exportNewMemories();
 			const stats = getStats();
-			const msg = `同步完成: 导入 ${imported} 条, 导出 ${exported} 条, 总计 ${stats.total} 条记忆`;
+			const msg = `同步完成: 导入 ${imported} 条, 回灌 ${reflowed.updated + reflowed.added} 条, 导出 ${exported} 条, 总计 ${stats.total} 条记忆`;
 			console.log(`[ai-memory-sync] ${msg}`);
 			ctx.ui?.notify(msg, "info");
 		},
@@ -1202,7 +1526,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("memory-export", {
 		description: "手动导出 Mnemopi 记忆到 Obsidian vault（单向: Mnemopi → Markdown）",
 		handler: async (_args, ctx) => {
-			const exported = exportNewMemories();
+			const exported = await exportNewMemories();
 			const msg = `导出完成: ${exported} 条记忆`;
 			console.log(`[ai-memory-sync] ${msg}`);
 			ctx.ui?.notify(msg, "info");
@@ -1211,10 +1535,11 @@ export default function (pi: ExtensionAPI): void {
 
 	// 命令: /memory-import — 仅导入
 	pi.registerCommand("memory-import", {
-		description: "手动导入 Obsidian inbox 中的笔记到 Mnemopi（单向: Markdown → Mnemopi）",
+		description: "手动导入 Obsidian 笔记到 Mnemopi（inbox + vault 内被改动过的笔记）",
 		handler: async (_args, ctx) => {
 			const imported = await importInbox();
-			const msg = `导入完成: ${imported} 条`;
+			const reflowed = await reflowFromVault();
+			const msg = `导入完成: inbox ${imported} 条, vault 回灌 ${reflowed.updated} 条更新 / ${reflowed.added} 条新增`;
 			console.log(`[ai-memory-sync] ${msg}`);
 			ctx.ui?.notify(msg, "info");
 		},
@@ -1339,7 +1664,7 @@ export default function (pi: ExtensionAPI): void {
 				const result = cleanExistingMemories();
 				// 重新导出清洗后的数据
 				lastExportedId = null;
-				const exported = exportNewMemories();
+				const exported = await exportNewMemories();
 				const msg = `清洗完成: 摘要 ${result.summarized} 条, importance 调整 ${result.decayed} 条, 重新导出 ${exported} 条`;
 				console.log(`[ai-memory-sync] ${msg}`);
 				ctx.ui?.notify(msg, "info");

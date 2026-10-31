@@ -21,9 +21,9 @@
 - **`memory_recall` 工具**: 模型可主动调用向量化语义检索，返回 top-K 相关记忆
 - **主动检索注入**: 回合开始时自动检索相关记忆并注入上下文（proactive retrieval）
 
-### 结构化记忆
-- **YAML frontmatter**: 每条记忆带 `id`/`source`/`importance`/`domain`/`keywords`/`tags`
-- **语义分块**: 长记忆按段落+句号分块（≤500 字符/块），每块独立检索
+## 结构化记忆
+- **YAML frontmatter**: 每条记忆带 `id`/`source`/`importance`/`domain`/`keywords`/`tags`/`sync_hash`
+- **`sync_hash` 双向判定**: 文件正文哈希与我们上次导出的哈希一致 → 是我们自己的产物；不一致 → 用户改过，回灌进库。库是唯一真相源，缺哈希的存量笔记一律不覆盖库。
 - **增量导出**: 用 `rowid` 游标避免相同时刻漏导
 
 ## 安装
@@ -42,6 +42,12 @@ cp config.example.json config.json
 # 编辑 config.json 填入你的路径和 API key
 
 omp 启动时自动发现并加载扩展。
+```
+
+`git-sync.mjs` 必须与 `index.ts` 同目录：所有 git 操作都在这个独立进程里跑，
+主进程只往 `.git/aims-queue.jsonl` 投递请求，不等待子进程（Windows 上等待子进程会占住 Bun 事件循环，导致输入卡死）。
+
+排查卡顿时，在 vault 里创建 `.git/aims-disabled` 即可让所有 git 执行器立刻退出并清空队列。
 
 ## 配置
 
